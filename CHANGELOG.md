@@ -50,6 +50,9 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - CodeIgniter 3 projects are now understood: every controller method and `routes.php` entry becomes a route, HMVC modules included, and calls through what `$this->load` loads, like `$this->user_model->find($id)`, link to the method they reach, so `codegraph_explore` can follow a request from its route through the model and into the view. Thanks @darkspock.
 - In Drupal, services from `*.services.yml`, plugin definitions (attributes and docblock annotations, a contrib module's own plugin types included) and `#[Hook]` methods are now part of the graph, and a call through `\Drupal::service('x')` or `$container->get('x')` links to the method on that service's class. Thanks @mikedamoiseau and @marcelovani.
 - In Next.js, a route now links to the `proxy.ts` or `middleware.ts` that runs before it, following `config.matcher`, so `codegraph impact`, `codegraph callers` and `codegraph_explore` show which routes a change to it reaches. Thanks @RIGOandre.
+- CodeGraph now indexes **F#** (`.fs` and `.fsx`): namespaces, modules, functions, values, active patterns, unions, records, enums, classes with their members and exceptions become searchable symbols.
+- In F#, `inherit` and `interface ... with` link a type to what it extends and implements, `open` and script `#load` are recorded as imports, and calls are followed through application, pipes, operators and qualified names.
+- In F#, a name resolves the way F# scopes it, through `open`, a module or type written before it, `[<AutoOpen>]` modules and `namespace global`, so a `map` or `format` in an unrelated namespace is never taken for yours, and an `open` counts only after the line it is written on and inside its own module, while a local `let` or a constructor parameter hides a function of the same name.
 
 ### Fixes
 
