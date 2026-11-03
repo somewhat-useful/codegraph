@@ -24,6 +24,7 @@ import {
   isFsharpCandidateReachable,
   isFsharpReachableFromDotnet,
   type DotnetFileScope,
+  type DotnetTarget,
   type FsharpCandidateScope,
   type FsharpRefScope,
 } from '../src/resolution/fsharp-scope';
@@ -717,32 +718,41 @@ describe('isFsharpReachableFromDotnet', () => {
     ignoreCase: false,
     ...over,
   });
-  const discount: FsharpCandidateScope = {
-    name: 'discount', container: 'Shop.Domain.Pricing', namespace: 'Shop.Domain', kind: 'function', holders: ['Shop.Domain.Pricing'], autoOpened: [],
-  };
-  const customer: FsharpCandidateScope = {
-    name: 'Customer', container: 'Shop.Domain', namespace: 'Shop.Domain', kind: 'struct', holders: ['Shop.Domain'], autoOpened: [],
-  };
-  const confirm: FsharpCandidateScope = {
-    name: 'Confirm', container: 'Shop.Domain.Order', namespace: 'Shop.Domain', kind: 'method', holders: ['Shop.Domain.Order'], autoOpened: [],
-  };
+  const target = (over: Partial<DotnetTarget>): DotnetTarget => ({
+    reachable: true, namespace: 'Shop.Domain', container: 'Shop.Domain.Pricing', name: 'discount', kind: 'function', isStatic: true, ...over,
+  });
+  const discount = target({});
+  const customer = target({ container: 'Shop.Domain', name: 'Customer', kind: 'struct' });
 
   it('reaches a module function through its module, by a using, a full path or an alias', () => {
     expect(isFsharpReachableFromDotnet(file(), 'Pricing.discount', discount)).toBe(true);
     expect(isFsharpReachableFromDotnet(file({ usings: new Set() }), 'Shop.Domain.Pricing.discount', discount)).toBe(true);
     expect(isFsharpReachableFromDotnet(file({ usings: new Set(), aliases: new Map([['P', 'Shop.Domain.Pricing']]) }), 'P.discount', discount)).toBe(true);
+    expect(isFsharpReachableFromDotnet(file({ usings: new Set(), aliases: new Map([['D', 'Shop.Domain']]) }), 'D.Pricing.discount', discount)).toBe(true);
     expect(isFsharpReachableFromDotnet(file({ usings: new Set() }), 'Pricing.discount', discount)).toBe(false);
   });
 
-  it('reaches a module from a namespace around the code, as C# looks names up', () => {
-    const inShop = file({ namespaces: ['Shop.Web.Api'], usings: new Set() });
-    expect(isFsharpReachableFromDotnet(inShop, 'Domain.Pricing.discount', discount)).toBe(true);
-    expect(isFsharpReachableFromDotnet(file({ namespaces: ['Elsewhere'], usings: new Set() }), 'Domain.Pricing.discount', discount)).toBe(false);
+  it('reaches a module from a namespace around the code, but never through a using of a namespace above it', () => {
+    // From `namespace Shop.Web`, `Domain.Pricing` is looked up in `Shop`, which is around the code.
+    expect(isFsharpReachableFromDotnet(file({ namespaces: ['Shop.Web.Api'], usings: new Set() }), 'Domain.Pricing.discount', discount)).toBe(true);
+    // `using Shop;` imports the types of `Shop`, not its namespace `Shop.Domain`.
+    expect(isFsharpReachableFromDotnet(file({ namespaces: ['Elsewhere'], usings: new Set(['Shop']) }), 'Domain.Pricing.discount', discount)).toBe(false);
   });
 
-  it('reaches a module function bare only under `using static`', () => {
+  it('reaches a static member bare only under `using static` of what holds it', () => {
     expect(isFsharpReachableFromDotnet(file(), 'discount', discount)).toBe(false);
     expect(isFsharpReachableFromDotnet(file({ statics: new Set(['Shop.Domain.Pricing']) }), 'discount', discount)).toBe(true);
+    const create = target({ container: 'Shop.Domain.Order', name: 'Create', kind: 'method', isStatic: true });
+    expect(isFsharpReachableFromDotnet(file({ statics: new Set(['Shop.Domain.Order']) }), 'Create', create)).toBe(true);
+  });
+
+  it('names a module by its compiled name: `<M>Module`, and a function by its `[<CompiledName>]`', () => {
+    const create = target({ container: 'Shop.Domain.OrderModule', name: 'create' });
+    expect(isFsharpReachableFromDotnet(file(), 'OrderModule.create', create)).toBe(true);
+    expect(isFsharpReachableFromDotnet(file(), 'Order.create', create)).toBe(false);
+    const compiled = target({ name: 'Discount' });
+    expect(isFsharpReachableFromDotnet(file(), 'Pricing.Discount', compiled)).toBe(true);
+    expect(isFsharpReachableFromDotnet(file(), 'Pricing.discount', compiled)).toBe(false);
   });
 
   it('reaches a type bare through a namespace the file is in or imports, and through an alias', () => {
@@ -750,12 +760,13 @@ describe('isFsharpReachableFromDotnet', () => {
     expect(isFsharpReachableFromDotnet(file({ namespaces: ['Shop.Domain.Web'], usings: new Set() }), 'Customer', customer)).toBe(true);
     expect(isFsharpReachableFromDotnet(file({ usings: new Set() }), 'Customer', customer)).toBe(false);
     expect(isFsharpReachableFromDotnet(file({ usings: new Set(), aliases: new Map([['C', 'Shop.Domain.Customer']]) }), 'C', customer)).toBe(true);
+    expect(isFsharpReachableFromDotnet(file({ usings: new Set(), aliases: new Map([['C', 'Shop.Domain.Other']]) }), 'C', customer)).toBe(false);
   });
 
-  it('reaches a member through a value only in a namespace the file sees, never the members every object has', () => {
-    expect(isFsharpReachableFromDotnet(file(), 'order.Confirm', confirm)).toBe(true);
-    expect(isFsharpReachableFromDotnet(file({ usings: new Set() }), 'order.Confirm', confirm)).toBe(false);
-    expect(isFsharpReachableFromDotnet(file(), 'order.ToString', { ...confirm, name: 'ToString' })).toBe(false);
+  it('never decides an instance member from the written name: the value\'s type is the resolver\'s to know', () => {
+    const confirm = target({ container: 'Shop.Domain.Order', name: 'Confirm', kind: 'method', isStatic: false });
+    expect(isFsharpReachableFromDotnet(file(), 'order.Confirm', confirm)).toBe(false);
+    expect(isFsharpReachableFromDotnet(file(), 'Order.Confirm', confirm)).toBe(false);
     expect(isFsharpReachableFromDotnet(file(), 'Confirm', confirm)).toBe(false);
   });
 
@@ -765,9 +776,10 @@ describe('isFsharpReachableFromDotnet', () => {
     expect(isFsharpReachableFromDotnet(vb, 'customer', customer)).toBe(true);
   });
 
-  it('never reaches the top of a script, and always `namespace global`', () => {
-    expect(isFsharpReachableFromDotnet(file(), 'run', { ...discount, container: '' })).toBe(false);
-    expect(isFsharpReachableFromDotnet(file({ usings: new Set() }), 'run', { ...discount, container: 'global' })).toBe(true);
+  it('never reaches the top of a script; reaches a type of the global namespace from anywhere', () => {
+    expect(isFsharpReachableFromDotnet(file(), 'Build.run', target({ reachable: false, namespace: '', container: 'Build', name: 'run' }))).toBe(false);
+    const global = target({ namespace: '', container: '', name: 'Gt', kind: 'class' });
+    expect(isFsharpReachableFromDotnet(file({ usings: new Set() }), 'Gt', global)).toBe(true);
   });
 });
 
@@ -820,6 +832,65 @@ namespace Shop.Web
     }
 }
 `,
+      'Store/Order.fs': `namespace Store
+
+type Order(total: decimal) =
+    member _.Total = total
+    static member Create(t) = Order(t)
+
+module Order =
+    let create t = Order(t)
+
+module Prices =
+    [<CompiledName("Discount")>]
+    let discount (rate: decimal) price = price * (1m - rate)
+`,
+      'Store/Web.cs': `using Store;
+using static Store.Order;
+
+namespace Store.Api
+{
+    public class C
+    {
+        public object ViaTypeName(decimal t) { return Order.create(t); }
+        public object ViaModuleClass(decimal t) { return OrderModule.create(t); }
+        public object ViaCompiledName(decimal p) { return Prices.Discount(0.1m, p); }
+        public object ViaFsharpName(decimal p) { return Prices.discount(0.1m, p); }
+        public object ViaStaticMember(decimal t) { return Create(t); }
+        public object OnForeignValue(System.Net.Http.HttpResponseMessage r) { return r.Total(); }
+    }
+}
+`,
+      'Near/Invoice.fs': `namespace Near
+
+type Invoice() =
+    member _.Id = 1
+`,
+      'Near/Domain/Invoice.fs': `namespace Near.Domain
+
+type Invoice() =
+    member _.Id = 2
+`,
+      'Near/Web/Billing.cs': `using Near.Domain;
+
+namespace Near.Web
+{
+    public class Billing
+    {
+        public object Make() { return new Invoice(); }
+    }
+}
+`,
+      'Vb/Nested.vb': `Namespace Shop
+    Namespace Reports
+        Public Class Nested
+            Public Function Run(p As Decimal) As Decimal
+                Return Domain.Pricing.discount(0.1D, p)
+            End Function
+        End Class
+    End Namespace
+End Namespace
+`,
       'Vb/Report.vb': `Imports Shop.Domain
 
 Namespace Shop.Reports
@@ -870,9 +941,33 @@ End Namespace
     expect(edgesOf('Web/NoUsing.cs', 'Run', 'calls')).toEqual([]);
   });
 
+  it('names a module as C# compiles it: `OrderModule` beside a type `Order`, and a function by its `[<CompiledName>]`', () => {
+    expect(edgesOf('Store/Web.cs', 'ViaTypeName', 'calls')).toEqual([]);
+    expect(edgesOf('Store/Web.cs', 'ViaModuleClass', 'calls')).toEqual(['Store::Order::create']);
+    expect(edgesOf('Store/Web.cs', 'ViaCompiledName', 'calls')).toEqual(['Store::Prices::discount']);
+    expect(edgesOf('Store/Web.cs', 'ViaFsharpName', 'calls')).toEqual([]);
+  });
+
+  it('links a static member of an F# type under `using static`', () => {
+    expect(edgesOf('Store/Web.cs', 'ViaStaticMember', 'calls')).toEqual(['Store::Order::Create']);
+  });
+
+  it('leaves a member on a value to its type: a foreign type\'s value links nothing in F#', () => {
+    expect(edgesOf('Store/Web.cs', 'OnForeignValue', 'calls')).toEqual([]);
+  });
+
+  it('takes a type of a namespace around the code before one a using imports, as C# looks names up', () => {
+    // From `namespace Near.Web`, `Invoice` is `Near.Invoice`, found in `Near` before `using Near.Domain;`.
+    expect(edgesOf('Near/Web/Billing.cs', 'Make', 'instantiates')).toEqual(['Near::Invoice']);
+  });
+
+  it('reads a VB.NET namespace nested in another as the path of both', () => {
+    expect(edgesOf('Vb/Nested.vb', 'Run', 'calls')).toEqual(['Shop.Domain::Pricing::discount']);
+  });
+
   it('shows the C# callers of an F# function', () => {
     const discountNode = project.getNodesInFile('Domain/Pricing.fs').find((n) => n.name === 'discount')!;
     const callers = project.getCallers(discountNode.id).map((c) => c.node.filePath).sort();
-    expect(callers).toEqual(['Vb/Report.vb', 'Web/Controller.cs', 'Web/Controller.cs', 'Web/Controller.cs']);
+    expect(callers).toEqual(['Vb/Nested.vb', 'Vb/Report.vb', 'Web/Controller.cs', 'Web/Controller.cs', 'Web/Controller.cs']);
   });
 });

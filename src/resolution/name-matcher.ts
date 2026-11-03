@@ -7975,23 +7975,40 @@ function csharpSupertypesOf(typeName: string, context: ResolutionContext): strin
 }
 
 /**
- * The types a C# file sees through static usings: its own `using static
- * A.B.Type;`, any file's `global using static`, and `<Using Include="A.B.Type"
- * Static="true"/>` in the `.csproj` / `Directory.Build.props` files above it
- * (AutoMapper imports its ExpressionBuilder helpers project-wide that way).
+ * The types a C# file sees through static usings, by simple name (see
+ * `csharpStaticUsingPaths`).
  */
 function csharpStaticUsings(file: string, context: ResolutionContext): Set<string> {
   let memo = CSHARP_STATIC_USINGS.get(context);
   if (!memo) CSHARP_STATIC_USINGS.set(context, (memo = new Map()));
   const hit = memo.get(file);
   if (hit) return hit;
-  const owners = new Set<string>(csharpProjectStaticUsings(path.posix.dirname(file), context, memo));
-  for (const m of (context.readFile(file) ?? '').matchAll(/^\s*(?:global\s+)?using\s+static\s+([\w.]+)\s*;/gm)) owners.add(m[1]!.split('.').pop()!);
+  const owners = new Set([...csharpStaticUsingPaths(file, context)].map((full) => full.split('.').pop()!));
   memo.set(file, owners);
   return owners;
 }
 
-/** Static usings that apply to every file under `dir`: project files on the way up, and every `global using static`. */
+const CSHARP_STATIC_USING_PATHS = new WeakMap<ResolutionContext, Map<string, Set<string>>>();
+
+/**
+ * The types a C# file sees through static usings, by full path: its own
+ * `using static A.B.Type;`, any file's `global using static`, and `<Using
+ * Include="A.B.Type" Static="true"/>` in the `.csproj` / `Directory.Build.props`
+ * files above it (AutoMapper imports its ExpressionBuilder helpers project-wide
+ * that way).
+ */
+function csharpStaticUsingPaths(file: string, context: ResolutionContext): Set<string> {
+  let memo = CSHARP_STATIC_USING_PATHS.get(context);
+  if (!memo) CSHARP_STATIC_USING_PATHS.set(context, (memo = new Map()));
+  const hit = memo.get(file);
+  if (hit) return hit;
+  const owners = new Set<string>(csharpProjectStaticUsings(path.posix.dirname(file), context, memo));
+  for (const m of (context.readFile(file) ?? '').matchAll(/^\s*(?:global\s+)?using\s+static\s+(?:global::)?([\w.]+)\s*;/gm)) owners.add(m[1]!);
+  memo.set(file, owners);
+  return owners;
+}
+
+/** Static usings, by full path, that apply to every file under `dir`: project files on the way up, and every `global using static`. */
 function csharpProjectStaticUsings(dir: string, context: ResolutionContext, memo: Map<string, Set<string>>): Set<string> {
   const key = `dir:${dir}`;
   const hit = memo.get(key);
@@ -8003,7 +8020,7 @@ function csharpProjectStaticUsings(dir: string, context: ResolutionContext, memo
       if (!f.endsWith('.cs')) continue;
       const text = context.readFile(f) ?? '';
       if (!text.includes('global using static')) continue;
-      for (const m of text.matchAll(/^\s*global\s+using\s+static\s+([\w.]+)\s*;/gm)) owners.add(m[1]!.split('.').pop()!);
+      for (const m of text.matchAll(/^\s*global\s+using\s+static\s+(?:global::)?([\w.]+)\s*;/gm)) owners.add(m[1]!);
     }
   } else {
     owners = new Set(csharpProjectStaticUsings(path.posix.dirname(dir), context, memo));
@@ -8022,7 +8039,7 @@ function csharpProjectStaticUsings(dir: string, context: ResolutionContext, memo
     } catch {
       continue;
     }
-    for (const m of text.matchAll(/<Using\s+Include\s*=\s*"([\w.]+)"[^>]*\bStatic\s*=\s*"true"/gi)) owners.add(m[1]!.split('.').pop()!);
+    for (const m of text.matchAll(/<Using\s+Include\s*=\s*"([\w.]+)"[^>]*\bStatic\s*=\s*"true"/gi)) owners.add(m[1]!);
   }
   memo.set(key, owners);
   return owners;
@@ -8064,13 +8081,15 @@ function csharpNamespaceScope(file: string, context: ResolutionContext): { names
  * (`isFsharpReachableFromDotnet`): the same namespaces, usings and aliases the
  * C# and VB.NET lookups here use, and the full paths of its `using static`.
  */
+/** The F# declaration a C# or VB.NET name means, by that language's lookup (see `matchDotnetNameInFsharp`). */
+export function matchDotnetNameIntoFsharp(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
+  return matchDotnetNameInFsharp(ref, context, dotnetScopeForFsharp);
+}
+
 function dotnetScopeForFsharp(ref: UnresolvedRef, context: ResolutionContext): DotnetFileScope | null {
   if (ref.language === 'csharp') {
     const scope = csharpNamespaceScope(ref.filePath, context);
-    const statics = new Set<string>();
-    const text = stripCommentsForRegex(context.readFile(ref.filePath) ?? '', 'java');
-    for (const m of text.matchAll(/^\s*(?:global\s+)?using\s+static\s+(?:global::)?([\w.]+)\s*;/gm)) statics.add(m[1]!);
-    return { namespaces: scope.namespaces, usings: scope.usings, aliases: scope.aliases, statics, ignoreCase: false };
+    return { namespaces: scope.namespaces, usings: scope.usings, aliases: scope.aliases, statics: csharpStaticUsingPaths(ref.filePath, context), ignoreCase: false };
   }
   if (ref.language === 'vbnet') {
     // VB.NET imports a module or type as it imports a namespace: its shared members are then seen bare.
@@ -22500,6 +22519,7 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   OBJC_SUPERS.delete(context);
   CSHARP_SUPERS.delete(context);
   CSHARP_STATIC_USINGS.delete(context);
+  CSHARP_STATIC_USING_PATHS.delete(context);
   CSHARP_NAMESPACE_SCOPES.delete(context);
   CSHARP_PROJECT_USINGS.delete(context);
   CSHARP_GLOBAL_USINGS.delete(context);
@@ -32744,7 +32764,7 @@ function matchReferenceInner(
   // class to them, its functions no class's methods, so the strategies above
   // never find them. After their own lookup, so a C# or VB.NET namesake wins.
   if (ref.language === 'csharp' || ref.language === 'vbnet') {
-    result = nmTimed('dotnetToFsharp', ref, () => matchDotnetNameInFsharp(ref, context, dotnetScopeForFsharp));
+    result = nmTimed('dotnetToFsharp', ref, () => matchDotnetNameIntoFsharp(ref, context));
     if (result) return result;
   }
 

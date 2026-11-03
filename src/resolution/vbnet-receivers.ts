@@ -714,11 +714,20 @@ function importedNamespaces(file: string, context: ResolutionContext): string[] 
 export function vbImportScope(file: string, context: ResolutionContext): { namespaces: string[]; imports: string[]; aliases: Map<string, string> } {
   const root = projectInfo(file, context).root.join('.');
   const namespaces = new Set<string>(root === '' ? [] : [root]);
+  // A `Namespace` inside another is inside it: `Namespace A` … `Namespace B` is `A.B`.
+  const open: string[] = [];
   for (const line of codeLines(file, context)) {
+    if (/^\s*End\s+Namespace\b/i.test(line)) {
+      open.pop();
+      continue;
+    }
     const m = /^\s*Namespace\s+(Global\.)?([\w.]+)/i.exec(line);
     if (!m) continue;
     const name = m[2]!.toLowerCase();
-    namespaces.add(m[1] || root === '' ? name : `${root}.${name}`);
+    const around = open.length > 0 ? open[open.length - 1]! : m[1] ? '' : root;
+    const full = around === '' ? name : `${around}.${name}`;
+    open.push(full);
+    namespaces.add(full);
   }
   const aliases = new Map<string, string>();
   for (const line of headerLines(file, context)) {

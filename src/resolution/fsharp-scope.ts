@@ -232,40 +232,91 @@ export interface DotnetFileScope {
 export type DotnetScopeReader = (ref: UnresolvedRef, context: ResolutionContext) => DotnetFileScope | null;
 
 /**
- * Pure rule: can a name a C# or VB.NET file writes as `written` (`discount`,
- * `Pricing.discount`, `order.Total`) mean the F# declaration `candidate`? C#
- * looks a name up in the namespaces around its code, then in its usings; an
- * F# module is a static class there, so its functions are reached through it
- * or through `using static`, never bare.
+ * An F# declaration as .NET sees it, which is what C# and VB.NET write: its
+ * namespace; the path of the static class or type that holds it, where an F#
+ * module is a static class — named `<M>Module` when a type of the same name sits
+ * beside it, or when it carries `[<CompilationRepresentation(ModuleSuffix)>]`;
+ * its name, or its `[<CompiledName>]`; and whether it is static (every module
+ * function and value is).
  */
-export function isFsharpReachableFromDotnet(file: DotnetFileScope, written: string, candidate: FsharpCandidateScope): boolean {
+export interface DotnetTarget {
+  /** False for what no .NET language can name: the top of an F# script. */
+  reachable: boolean;
+  namespace: string;
+  /** Full path of what holds it: a namespace for a type declared in one, else a static class or type. */
+  container: string;
+  name: string;
+  kind: string;
+  isStatic: boolean;
+}
+
+/**
+ * Pure rule: how near the name a C# or VB.NET file writes as `written`
+ * (`discount`, `Pricing.discount`, `OrderModule.create`) finds the F#
+ * declaration `target` — 0 for the namespace around the code, then one more for
+ * each namespace outward to the global one, then the file's usings — or null
+ * when the name cannot mean it. The nearest wins, as in C#: from `namespace
+ * Shop.Web` with `using Shop.Domain;`, `Order` is `Shop.Order` before
+ * `Shop.Domain.Order`.
+ *
+ * C#'s lookup: a qualified name's first segment is looked up in each namespace
+ * around the code, outward to the global one, then among the types (never the
+ * nested namespaces) of the namespaces its usings import; an alias stands for
+ * what it names. A bare name is a type of those namespaces, or a static member
+ * of a type a `using static` imports. A member on a value is the value's type's,
+ * which only the C# or VB.NET resolver can tell: never decided here.
+ */
+export function dotnetLookupRank(file: DotnetFileScope, written: string, target: DotnetTarget): number | null {
+  if (!target.reachable) return null;
   const norm = (text: string): string => (file.ignoreCase ? text.toLowerCase() : text);
-  const container = norm(candidate.container);
-  // The top of a script is no class a .NET language can name.
-  if (container === '') return false;
-  if (container === GLOBAL_NAMESPACE) return true;
-  const seen = (namespace: string): boolean =>
-    namespace === '' || file.usings.has(namespace) || file.namespaces.some((own) => isPathPrefix(namespace, own));
+  const container = norm(target.container);
+  const namespace = norm(target.namespace);
+  const own = norm(target.name);
+  const isType = TYPE_KINDS.has(target.kind);
+  // An instance member is reached through a value, never through its type's name.
+  if (!isType && !target.isStatic) return null;
+
+  // The namespaces a name is looked up in, nearest first: around the code, outward to the global one.
+  const chains = (file.namespaces.length > 0 ? file.namespaces : ['']).map((ns) => scopePrefixes(norm(ns)).reverse());
+  const viaUsings = Math.max(...chains.map((c) => c.length));
+  const nearest = (path: string): number | null => {
+    const at = chains.map((c) => c.indexOf(path)).filter((i) => i >= 0);
+    return at.length > 0 ? Math.min(...at) : null;
+  };
 
   const segments = norm(written).split('.');
   const name = segments.pop() ?? '';
-  const aliased = segments.length > 0 ? file.aliases.get(segments[0]!) : undefined;
-  const qualifier = aliased !== undefined ? [aliased, ...segments.slice(1)].join('.') : segments.join('.');
-  const isMember = MEMBER_KINDS.has(candidate.kind);
-
-  if (qualifier === '') {
+  if (segments.length === 0) {
     // `using Customer = Shop.Domain.Customer;` names that one type.
     const alias = file.aliases.get(name);
-    if (alias !== undefined) return alias === joinPath(container, norm(candidate.name));
-    if (isMember) return false;
-    if (TYPE_KINDS.has(candidate.kind)) return seen(container) || file.statics.has(container);
-    return file.statics.has(container);
+    if (alias !== undefined) return alias === joinPath(container, own) ? viaUsings : null;
   }
-  // Through its module or type, by its full path or from a namespace the file sees.
-  if (container === qualifier) return true;
-  if (container.endsWith(`.${qualifier}`) && seen(container.slice(0, container.length - qualifier.length - 1))) return true;
-  // Through a value: a member of a type in a namespace the file sees. Its type is whatever the value's is.
-  return isMember && !UNIVERSAL_MEMBERS.has(candidate.name) && seen(norm(candidate.namespace));
+  if (name !== own) return null;
+  const aliased = segments.length > 0 ? file.aliases.get(segments[0]!) : undefined;
+  const qualifier = aliased !== undefined ? [aliased, ...segments.slice(1)].join('.') : segments.join('.');
+
+  if (qualifier === '') {
+    if (isType && container === namespace) {
+      const around = nearest(namespace);
+      if (around !== null) return around;
+      if (file.usings.has(namespace)) return viaUsings;
+    }
+    return file.statics.has(container) ? viaUsings : null;
+  }
+  // An alias, or the rest of the path from a namespace around the code (the global one: the full path).
+  if (aliased !== undefined) return container === qualifier ? viaUsings : null;
+  if (container === qualifier) return nearest('') ?? viaUsings;
+  if (container.endsWith(`.${qualifier}`)) {
+    const around = nearest(container.slice(0, container.length - qualifier.length - 1));
+    if (around !== null) return around;
+  }
+  // From a namespace a using imports: the qualifier starts at one of its types.
+  return container === joinPath(namespace, qualifier) && file.usings.has(namespace) ? viaUsings : null;
+}
+
+/** Can the name a C# or VB.NET file writes as `written` mean the F# declaration `target` at all? */
+export function isFsharpReachableFromDotnet(file: DotnetFileScope, written: string, target: DotnetTarget): boolean {
+  return dotnetLookupRank(file, written, target) !== null;
 }
 
 interface FileScope {
@@ -487,6 +538,100 @@ function autoOpenedAround(candidate: Node, scopes: ReadonlyMap<string, Node>): s
   return found;
 }
 
+/** The kinds of an F# type definition. */
+const TYPE_DEFINITION_KINDS: ReadonlySet<string> = new Set(['class', 'struct', 'interface', 'union', 'enum', 'type_alias']);
+
+/** `[<CompiledName("Discount")>]` → `Discount`. */
+function compiledNameOf(node: Node): string | null {
+  for (const d of node.decorators ?? []) {
+    const m = /^CompiledName(?:Attribute)?\s*\(\s*"([^"]+)"\s*\)$/.exec(d);
+    if (m) return m[1]!;
+  }
+  return null;
+}
+
+const COMPILED_NAMES = new WeakMap<ResolutionContext, Map<string, Node[]>>();
+
+/** F# declarations whose `[<CompiledName>]` is `name`, which a lookup by their F# name does not find. */
+function compiledNamed(name: string, context: ResolutionContext): Node[] {
+  let byName = COMPILED_NAMES.get(context);
+  if (!byName) {
+    byName = new Map();
+    for (const kind of ['function', 'method', 'property', 'variable', 'constant'] as const) {
+      for (const n of context.getNodesByKind(kind)) {
+        if (n.language !== 'fsharp') continue;
+        const compiled = compiledNameOf(n);
+        if (compiled !== null && compiled.toLowerCase() !== n.name.toLowerCase()) {
+          byName.set(compiled, [...(byName.get(compiled) ?? []), n]);
+        }
+      }
+    }
+    COMPILED_NAMES.set(context, byName);
+  }
+  return byName.get(name) ?? [];
+}
+
+const DOTNET_TARGETS = new WeakMap<ResolutionContext, Map<string, DotnetTarget>>();
+
+/** An F# declaration as .NET names it (see `DotnetTarget`). */
+function dotnetTargetOf(candidate: Node, context: ResolutionContext): DotnetTarget {
+  let perContext = DOTNET_TARGETS.get(context);
+  if (!perContext) DOTNET_TARGETS.set(context, (perContext = new Map()));
+  const cached = perContext.get(candidate.id);
+  if (cached) return cached;
+  const nodes = context.getNodesInFile(candidate.filePath);
+  const namespace: string[] = [];
+  const holders: string[] = [];
+  const segments = candidate.qualifiedName.split('::').slice(0, -1);
+  let qualified = '';
+  for (const segment of segments) {
+    qualified = qualified === '' ? segment : `${qualified}::${segment}`;
+    // A type and a module of one name share a qualified name: the one around the candidate is meant.
+    const around = nodes.filter((n) => n.qualifiedName === qualified && n.id !== candidate.id && containsLine(n, candidate.startLine));
+    const scope = around.find((n) => n.kind === 'namespace' || n.kind === 'module') ?? around[0];
+    if (scope?.kind === 'namespace' && holders.length === 0) {
+      if (segment !== GLOBAL_NAMESPACE) namespace.push(...segment.split('.'));
+    } else if (scope?.kind === 'module') {
+      // `module A.B.C` at the top of a file is module `C` in namespace `A.B`.
+      const parts = segment.split('.');
+      const own = parts.pop()!;
+      if (holders.length === 0) namespace.push(...parts);
+      holders.push(hasModuleSuffix(scope, nodes) ? `${own}Module` : own);
+    } else {
+      holders.push(segment);
+    }
+  }
+  // A file that declares no namespace or module puts its top level in a module named after
+  // the file: a static class in the global namespace, unless the file is a script, which is no
+  // part of an assembly.
+  if (segments.length === 0) holders.push(implicitModule(candidate.filePath));
+  const ns = namespace.join('.');
+  const target: DotnetTarget = {
+    reachable: !(segments.length === 0 && /\.fsx$/i.test(candidate.filePath)),
+    namespace: ns,
+    container: holders.length > 0 ? joinPath(ns, holders.join('.')) : ns,
+    name: compiledNameOf(candidate) ?? (candidate.kind === 'module' && hasModuleSuffix(candidate, nodes) ? `${candidate.name}Module` : candidate.name),
+    kind: candidate.kind,
+    isStatic: !MEMBER_KINDS.has(candidate.kind) || candidate.isStatic === true,
+  };
+  perContext.set(candidate.id, target);
+  return target;
+}
+
+/**
+ * Whether .NET names F# module `module` `<M>Module`: it carries
+ * `[<CompilationRepresentation(ModuleSuffix)>]`, or a type of the same name is
+ * declared beside it, which since F# 4.1 adds the suffix on its own.
+ */
+function hasModuleSuffix(module: Node, nodesInFile: readonly Node[]): boolean {
+  return module.decorators?.some((d) => /\bModuleSuffix\b/.test(d)) === true ||
+    nodesInFile.some((n) => n.qualifiedName === module.qualifiedName && TYPE_DEFINITION_KINDS.has(n.kind));
+}
+
+function containsLine(node: Node, line: number): boolean {
+  return node.startLine <= line && (node.endLine ?? node.startLine) >= line;
+}
+
 const CANDIDATE_SCOPES = new WeakMap<ResolutionContext, Map<string, FsharpCandidateScope>>();
 
 const DOTNET_FILE_SCOPES = new WeakMap<ResolutionContext, Map<string, DotnetFileScope | null>>();
@@ -503,6 +648,8 @@ function dotnetFileScopeOf(ref: UnresolvedRef, context: ResolutionContext, read:
 /** Forget what was read from files and candidates; called when the resolver drops its caches after a sync. */
 export function clearFsharpScopeCaches(context: ResolutionContext): void {
   DOTNET_FILE_SCOPES.delete(context);
+  DOTNET_TARGETS.delete(context);
+  COMPILED_NAMES.delete(context);
   FILE_SCOPES.delete(context);
   DECLARED_NAMESPACES.delete(context);
   CANDIDATE_SCOPES.delete(context);
@@ -530,6 +677,21 @@ function scopeOfCandidate(candidate: Node, context: ResolutionContext): FsharpCa
   return scope;
 }
 
+/**
+ * The name a C# or VB.NET reference is written as, with its qualifier. An
+ * extractor that records a path call by its last name (VB.NET's
+ * `Domain.Pricing.discount(…)` as `discount`) leaves the qualifier in the source,
+ * where it is read back at the reference's position.
+ */
+function writtenDotnetName(ref: UnresolvedRef, context: ResolutionContext): string {
+  if (ref.referenceName.includes('.')) return ref.referenceName;
+  const line = (context.getFileLines?.(ref.filePath) ?? context.readFile(ref.filePath)?.split(/\r?\n/))?.[ref.line - 1];
+  if (line === undefined) return ref.referenceName;
+  const at = indexOfWord(line, ref.referenceName, Math.min(ref.column, line.length));
+  const qualifier = at < 0 ? null : qualifierBefore(line, at);
+  return qualifier && qualifier !== '_' ? `${qualifier}.${ref.referenceName}` : ref.referenceName;
+}
+
 /** What each reference kind of a C# or VB.NET name can land on in F#: a call invokes, a construction builds. */
 const DOTNET_TARGET_KINDS: Readonly<Record<string, ReadonlySet<string>>> = {
   calls: new Set(['function', 'method', 'property', 'variable', 'constant', 'enum_member']),
@@ -547,15 +709,23 @@ export function matchDotnetNameInFsharp(ref: UnresolvedRef, context: ResolutionC
   if (!DOTNET_REFERRERS.has(ref.language) || !SYMBOL_REFERENCE_KINDS.has(ref.referenceKind)) return null;
   const name = ref.referenceName.slice(ref.referenceName.lastIndexOf('.') + 1);
   if (name === '') return null;
-  const named = ref.language === 'vbnet' ? context.getNodesByLowerName(name.toLowerCase()) : context.getNodesByName(name);
+  // A `[<CompiledName>]` can differ from the F# name in case only: look it up by both.
+  const named = context.getNodesByLowerName(name.toLowerCase());
   const allowed = DOTNET_TARGET_KINDS[ref.referenceKind];
-  const declared = named.filter((n) => n.language === 'fsharp' && !NON_SYMBOL_KINDS.has(n.kind) && (!allowed || allowed.has(n.kind)));
+  const declared = [...named, ...compiledNamed(name, context)]
+    .filter((n) => n.language === 'fsharp' && !NON_SYMBOL_KINDS.has(n.kind) && (!allowed || allowed.has(n.kind)));
   if (declared.length === 0) return null;
   const file = dotnetFileScopeOf(ref, context, read);
   if (!file) return null;
-  const reached = declared.filter((n) => isFsharpReachableFromDotnet(file, ref.referenceName, scopeOfCandidate(n, context)));
-  // Overloads of one member share a qualified name; two different declarations are a guess.
-  if (reached.length === 0 || reached.some((n) => n.qualifiedName !== reached[0]!.qualifiedName)) return null;
+  const written = writtenDotnetName(ref, context);
+  // The nearest in C#'s lookup order; overloads of one member share a qualified name, two different declarations are a guess.
+  const ranked = declared
+    .map((n) => ({ n, rank: dotnetLookupRank(file, written, dotnetTargetOf(n, context)) }))
+    .filter((r): r is { n: Node; rank: number } => r.rank !== null);
+  if (ranked.length === 0) return null;
+  const best = Math.min(...ranked.map((r) => r.rank));
+  const reached = ranked.filter((r) => r.rank === best).map((r) => r.n);
+  if (reached.some((n) => n.qualifiedName !== reached[0]!.qualifiedName)) return null;
   return { original: ref, targetNodeId: reached[0]!.id, confidence: 0.9, resolvedBy: 'qualified-name' };
 }
 
@@ -572,8 +742,12 @@ export function isFsharpCandidateInScope(
     if (ref.language === 'razor') return false;
     if (!DOTNET_REFERRERS.has(ref.language)) return true;
     if (!SYMBOL_REFERENCE_KINDS.has(ref.referenceKind) || NON_SYMBOL_KINDS.has(candidate.kind)) return true;
+    const target = dotnetTargetOf(candidate, context);
+    // An instance member on a value is the value's type's: that is the C# or VB.NET
+    // resolver's to know (`var o = new Order(…); o.Confirm()`), not the written name's.
+    if (!target.isStatic && ref.referenceName.includes('.')) return true;
     const file = dotnetFileScopeOf(ref, context, dotnetScope);
-    return file !== null && isFsharpReachableFromDotnet(file, ref.referenceName, scopeOfCandidate(candidate, context));
+    return file !== null && isFsharpReachableFromDotnet(file, writtenDotnetName(ref, context), target);
   }
   // A Razor component is not something F# names.
   if (candidate.language === 'razor') return false;

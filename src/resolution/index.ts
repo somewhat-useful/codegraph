@@ -38,7 +38,7 @@ import { clearCppTypeAliasMemos } from './cpp-type-aliases';
 import { adoptProjectScans, readProjectScans, type ProjectScans } from './project-scans';
 import { clearCppIncluderMemos } from './cpp-includers';
 import { clearCMacroRenames } from './c-macro-renames';
-import { isObjcDeclaredTypeRef, matchByExactName } from './name-matcher';
+import { isObjcDeclaredTypeRef, matchByExactName, matchDotnetNameIntoFsharp } from './name-matcher';
 import { clearCFeatureVariantMemos } from './c-feature-variants';
 import { clearAmbientModuleMemos, ambientModuleDeclarations } from './ambient-modules';
 import { matchShopifyThemeFile } from './shopify-themes';
@@ -1857,9 +1857,10 @@ export class ReferenceResolver {
     // whose declared type's member it links — and no framework, import or
     // name strategy guesses past that. Nor past a `With` block's call through
     // a receiver path (`.Run()` in `With Me._h`).
-    if (isVbMemberRead(ref)) return this.gateLanguage(matchVbMemberRead(ref, this.context), ref);
+    // What VB.NET's scoping finds no VB.NET declaration for may be an F# module's or type's, as VB.NET sees it.
+    if (isVbMemberRead(ref)) return this.gateLanguage(matchVbMemberRead(ref, this.context) ?? matchDotnetNameIntoFsharp(ref, this.context), ref);
     if (isVbPathCall(ref)) {
-      return this.gateLanguage(matchVbPathCall(ref, this.context, (name) => isStdMethodName('vbnet', name)), ref);
+      return this.gateLanguage(matchVbPathCall(ref, this.context, (name) => isStdMethodName('vbnet', name)) ?? matchDotnetNameIntoFsharp(ref, this.context), ref);
     }
 
     // The last name of a TypeScript type written qualified (`React.ReactNode`,
