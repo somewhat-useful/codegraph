@@ -339,8 +339,12 @@ const UTF8 = new TextDecoder('utf-8');
  * transport stream (#1910), or a `.fs` that is a GLSL shader or Forth.
  * Decided from bytes the caller has already read and from those alone, so a
  * full index, a sync of the one edited file and a fresh re-index agree, and a
- * tracked file that turns into one is dropped. A codegraph.json mapping for
- * `.fs` is the project's answer and is not second-guessed.
+ * tracked file that turns into one is dropped.
+ *
+ * A codegraph.json mapping for `.fs` turns the F# check off: which text
+ * language a `.fs` file is written in is the project's to say. It never turns
+ * the MPEG-TS check off, whatever `.ts` is mapped to: a video is source in no
+ * language, and parsing one costs half a minute for nothing (#1910).
  */
 export function isForeignToExtension(filePath: string, bytes: Uint8Array, overrides?: Record<string, Language>): 'mpeg-ts' | 'not-fsharp' | null {
   if (hasMpegTsExtension(filePath) && isMpegTransportStream(bytes.subarray(0, MPEG_TS_SNIFF_BYTES))) return 'mpeg-ts';

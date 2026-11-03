@@ -5,13 +5,17 @@
  * repository neither loads the F# grammar nor gets its files parsed into error
  * trees, and an F# file that turns into one is dropped.
  */
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, afterEach, vi } from 'vitest';
+import { execFileSync } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import { CodeGraph } from '../src';
 import { detectLanguage, isForeignToExtension, isSourceFile, looksLikeFsharp } from '../src/extraction/grammars';
-import { preloadLanguagesForFiles } from '../src/extraction';
+import { preloadLanguagesForFiles, scanDirectoryAsync } from '../src/extraction';
+
+// A spreadable copy of `fs`, so the discovery test can spy on `openSync`.
+vi.mock('fs', async (importOriginal) => ({ ...await importOriginal<typeof import('fs')>() }));
 
 const GLSL_FRAGMENT = `#version 330 core
 out vec4 FragColor;
@@ -220,6 +224,34 @@ describe('indexing .fs files', () => {
       expect(cg.searchNodes('discount').some((r) => r.node.filePath === 'src/Pricing.fs')).toBe(true);
     } finally {
       await cg.close();
+    }
+  });
+});
+
+describe('discovering .fs files', () => {
+  it('opens no file, on the directory walk or the git path', async () => {
+    for (const withGit of [false, true]) {
+      const dir = createProject({ 'shaders/basic.fs': GLSL_FRAGMENT, 'src/Pricing.fs': FSHARP_MODULE });
+      if (withGit) {
+        const git = (...a: string[]) => execFileSync('git', a, { cwd: dir, stdio: 'pipe' });
+        git('init', '-q'); git('config', 'user.email', 't@t'); git('config', 'user.name', 't');
+        git('add', '.'); git('commit', '-qm', 'init');
+      }
+      const opened: string[] = [];
+      const real = fs.openSync;
+      const spy = vi.spyOn(fs, 'openSync').mockImplementation(((file: fs.PathLike, ...rest: unknown[]) => {
+        opened.push(String(file));
+        return (real as (...args: unknown[]) => number)(file, ...rest);
+      }) as typeof fs.openSync);
+      let scanned: string[];
+      try {
+        scanned = await scanDirectoryAsync(dir);
+      } finally {
+        spy.mockRestore();
+      }
+      // Both are listed by name; the shader is judged where it is read.
+      expect(scanned.sort()).toEqual(['shaders/basic.fs', 'src/Pricing.fs']);
+      expect(opened.filter((f) => f.endsWith('.fs'))).toEqual([]);
     }
   });
 });

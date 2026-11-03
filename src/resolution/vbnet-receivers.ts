@@ -704,6 +704,30 @@ function importedNamespaces(file: string, context: ResolutionContext): string[] 
   return imports;
 }
 
+/**
+ * What a VB.NET file can name, lowercased, for a language that has no VB
+ * types of its own to reason with (F#'s scope rules): the namespaces its code
+ * runs in — inside its project's root namespace unless written `Global.` —
+ * the namespaces and types it imports, its own and its project's, and its
+ * import aliases, spelled out.
+ */
+export function vbImportScope(file: string, context: ResolutionContext): { namespaces: string[]; imports: string[]; aliases: Map<string, string> } {
+  const root = projectInfo(file, context).root.join('.');
+  const namespaces = new Set<string>(root === '' ? [] : [root]);
+  for (const line of codeLines(file, context)) {
+    const m = /^\s*Namespace\s+(Global\.)?([\w.]+)/i.exec(line);
+    if (!m) continue;
+    const name = m[2]!.toLowerCase();
+    namespaces.add(m[1] || root === '' ? name : `${root}.${name}`);
+  }
+  const aliases = new Map<string, string>();
+  for (const line of headerLines(file, context)) {
+    const m = /^\s*Imports\s+([A-Za-z_]\w*)\s*=\s*(?:Global\.)?([\w.]+)/i.exec(line);
+    if (m) aliases.set(m[1]!.toLowerCase(), m[2]!.toLowerCase());
+  }
+  return { namespaces: [...namespaces], imports: importedNamespaces(file, context), aliases };
+}
+
 const VB_ALIASES = new WeakMap<ResolutionContext, Map<string, Map<string, VbType>>>();
 
 /** A file's import aliases: `Imports TDJob = SCrawler.DownloadObjects.TDownloader.Job`, by lowercased alias. */

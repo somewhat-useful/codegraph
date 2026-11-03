@@ -20,10 +20,18 @@
  *
  * A same-named function in a namespace none of that reaches — `map`, `bind`,
  * `format` — is never what the name means.
+ *
+ * C# and VB.NET see an F# module as a static class and an F# namespace as a
+ * namespace, so a name they write reaches an F# declaration by their own
+ * lookup (`isFsharpReachableFromDotnet`): through the module or type it is
+ * written with (`Pricing.discount`, `Shop.Domain.Pricing.discount`, an alias),
+ * bare when it is a type in a namespace the file is in or imports, or a member
+ * of a module the file imports `static`ally, and through a value when it is a
+ * member of a type in such a namespace.
  */
 
 import type { Node } from '../types';
-import type { ResolutionContext, UnresolvedRef } from './types';
+import type { ResolutionContext, ResolvedRef, UnresolvedRef } from './types';
 
 /** Reference kinds that name a declaration (an `open` names a namespace, which is not a symbol). */
 const SYMBOL_REFERENCE_KINDS: ReadonlySet<string> = new Set([
@@ -62,8 +70,11 @@ const UNIVERSAL_MEMBERS: ReadonlySet<string> = new Set([
 /** Languages an F# name can be written against: its own and the other .NET ones. */
 const SCOPED_LANGUAGES: ReadonlySet<string> = new Set(['fsharp', 'csharp', 'vbnet']);
 
-/** The .NET languages that share a family with F# and whose references must not land on F# declarations. */
-const DOTNET_REFERRERS: ReadonlySet<string> = new Set(['csharp', 'vbnet', 'razor']);
+/** The .NET languages whose names reach F# declarations by their own lookup rules (`isFsharpReachableFromDotnet`). */
+const DOTNET_REFERRERS: ReadonlySet<string> = new Set(['csharp', 'vbnet']);
+
+/** What a type is, to a C# or VB.NET name: seen bare through its namespace. */
+const TYPE_KINDS: ReadonlySet<string> = new Set(['class', 'struct', 'interface', 'union', 'enum', 'type_alias', 'module']);
 
 /** Scopes whose own contents sit inside them: a reference written in one is relative to it. */
 const OWN_SCOPE_KINDS: ReadonlySet<string> = new Set(['namespace', 'module', 'class', 'struct', 'interface', 'union', 'enum']);
@@ -200,6 +211,61 @@ export function isFsharpCandidateReachable(ref: FsharpRefScope, candidate: Fshar
   // enclosing scope or an opened one.
   if (isMember) return sameFile && isPathPrefix(c, ref.container);
   return candidate.holders.some((h) => opens.has(h) || isPathPrefix(h, ref.container));
+}
+
+/**
+ * What a C# or VB.NET file can name, read by that language's own resolver:
+ * the namespaces its code is in, the namespaces it imports (its own `using` /
+ * `Imports`, its project's, `global using`), its aliases spelled out to full
+ * paths, and the modules and types it imports statically. A VB.NET scope is
+ * lowercased, with `ignoreCase` set, as VB.NET names are.
+ */
+export interface DotnetFileScope {
+  namespaces: readonly string[];
+  usings: ReadonlySet<string>;
+  aliases: ReadonlyMap<string, string>;
+  statics: ReadonlySet<string>;
+  ignoreCase: boolean;
+}
+
+/** Reads the scope of the C# or VB.NET file a reference is written in; null for any other language. */
+export type DotnetScopeReader = (ref: UnresolvedRef, context: ResolutionContext) => DotnetFileScope | null;
+
+/**
+ * Pure rule: can a name a C# or VB.NET file writes as `written` (`discount`,
+ * `Pricing.discount`, `order.Total`) mean the F# declaration `candidate`? C#
+ * looks a name up in the namespaces around its code, then in its usings; an
+ * F# module is a static class there, so its functions are reached through it
+ * or through `using static`, never bare.
+ */
+export function isFsharpReachableFromDotnet(file: DotnetFileScope, written: string, candidate: FsharpCandidateScope): boolean {
+  const norm = (text: string): string => (file.ignoreCase ? text.toLowerCase() : text);
+  const container = norm(candidate.container);
+  // The top of a script is no class a .NET language can name.
+  if (container === '') return false;
+  if (container === GLOBAL_NAMESPACE) return true;
+  const seen = (namespace: string): boolean =>
+    namespace === '' || file.usings.has(namespace) || file.namespaces.some((own) => isPathPrefix(namespace, own));
+
+  const segments = norm(written).split('.');
+  const name = segments.pop() ?? '';
+  const aliased = segments.length > 0 ? file.aliases.get(segments[0]!) : undefined;
+  const qualifier = aliased !== undefined ? [aliased, ...segments.slice(1)].join('.') : segments.join('.');
+  const isMember = MEMBER_KINDS.has(candidate.kind);
+
+  if (qualifier === '') {
+    // `using Customer = Shop.Domain.Customer;` names that one type.
+    const alias = file.aliases.get(name);
+    if (alias !== undefined) return alias === joinPath(container, norm(candidate.name));
+    if (isMember) return false;
+    if (TYPE_KINDS.has(candidate.kind)) return seen(container) || file.statics.has(container);
+    return file.statics.has(container);
+  }
+  // Through its module or type, by its full path or from a namespace the file sees.
+  if (container === qualifier) return true;
+  if (container.endsWith(`.${qualifier}`) && seen(container.slice(0, container.length - qualifier.length - 1))) return true;
+  // Through a value: a member of a type in a namespace the file sees. Its type is whatever the value's is.
+  return isMember && !UNIVERSAL_MEMBERS.has(candidate.name) && seen(norm(candidate.namespace));
 }
 
 interface FileScope {
@@ -423,8 +489,20 @@ function autoOpenedAround(candidate: Node, scopes: ReadonlyMap<string, Node>): s
 
 const CANDIDATE_SCOPES = new WeakMap<ResolutionContext, Map<string, FsharpCandidateScope>>();
 
+const DOTNET_FILE_SCOPES = new WeakMap<ResolutionContext, Map<string, DotnetFileScope | null>>();
+
+/** A C# or VB.NET file's scope, read once per resolution context. */
+function dotnetFileScopeOf(ref: UnresolvedRef, context: ResolutionContext, read: DotnetScopeReader | undefined): DotnetFileScope | null {
+  if (!read) return null;
+  let perFile = DOTNET_FILE_SCOPES.get(context);
+  if (!perFile) DOTNET_FILE_SCOPES.set(context, (perFile = new Map()));
+  if (!perFile.has(ref.filePath)) perFile.set(ref.filePath, read(ref, context));
+  return perFile.get(ref.filePath) ?? null;
+}
+
 /** Forget what was read from files and candidates; called when the resolver drops its caches after a sync. */
 export function clearFsharpScopeCaches(context: ResolutionContext): void {
+  DOTNET_FILE_SCOPES.delete(context);
   FILE_SCOPES.delete(context);
   DECLARED_NAMESPACES.delete(context);
   CANDIDATE_SCOPES.delete(context);
@@ -452,10 +530,51 @@ function scopeOfCandidate(candidate: Node, context: ResolutionContext): FsharpCa
   return scope;
 }
 
+/** What each reference kind of a C# or VB.NET name can land on in F#: a call invokes, a construction builds. */
+const DOTNET_TARGET_KINDS: Readonly<Record<string, ReadonlySet<string>>> = {
+  calls: new Set(['function', 'method', 'property', 'variable', 'constant', 'enum_member']),
+  instantiates: new Set(['class', 'struct', 'union']),
+};
+
+/**
+ * The F# declaration a C# or VB.NET name means, by that language's lookup
+ * (`isFsharpReachableFromDotnet`): `Pricing.discount(…)`, `Shop.Domain.Pricing.discount(…)`,
+ * `P.discount(…)` through an alias, `discount(…)` under `using static`, `new Customer(…)`.
+ * Their own resolvers look for a C# or VB.NET class and method, and an F# module
+ * is neither. Null unless exactly one F# declaration is reached: silent beats wrong.
+ */
+export function matchDotnetNameInFsharp(ref: UnresolvedRef, context: ResolutionContext, read: DotnetScopeReader): ResolvedRef | null {
+  if (!DOTNET_REFERRERS.has(ref.language) || !SYMBOL_REFERENCE_KINDS.has(ref.referenceKind)) return null;
+  const name = ref.referenceName.slice(ref.referenceName.lastIndexOf('.') + 1);
+  if (name === '') return null;
+  const named = ref.language === 'vbnet' ? context.getNodesByLowerName(name.toLowerCase()) : context.getNodesByName(name);
+  const allowed = DOTNET_TARGET_KINDS[ref.referenceKind];
+  const declared = named.filter((n) => n.language === 'fsharp' && !NON_SYMBOL_KINDS.has(n.kind) && (!allowed || allowed.has(n.kind)));
+  if (declared.length === 0) return null;
+  const file = dotnetFileScopeOf(ref, context, read);
+  if (!file) return null;
+  const reached = declared.filter((n) => isFsharpReachableFromDotnet(file, ref.referenceName, scopeOfCandidate(n, context)));
+  // Overloads of one member share a qualified name; two different declarations are a guess.
+  if (reached.length === 0 || reached.some((n) => n.qualifiedName !== reached[0]!.qualifiedName)) return null;
+  return { original: ref, targetNodeId: reached[0]!.id, confidence: 0.9, resolvedBy: 'qualified-name' };
+}
+
 /** Is `candidate` something `ref` can mean? Always true for refs and candidates F# has nothing to say about. */
-export function isFsharpCandidateInScope(candidate: Node, ref: UnresolvedRef, context: ResolutionContext): boolean {
-  // C#, VB.NET and Razor reach F# declarations through their own `using` rules, which nothing models: silent beats wrong.
-  if (ref.language !== 'fsharp') return candidate.language !== 'fsharp' || !DOTNET_REFERRERS.has(ref.language);
+export function isFsharpCandidateInScope(
+  candidate: Node,
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+  dotnetScope?: DotnetScopeReader,
+): boolean {
+  if (ref.language !== 'fsharp') {
+    if (candidate.language !== 'fsharp') return true;
+    // Razor's `@using` is not modelled: a Razor name never lands on an F# declaration. Silent beats wrong.
+    if (ref.language === 'razor') return false;
+    if (!DOTNET_REFERRERS.has(ref.language)) return true;
+    if (!SYMBOL_REFERENCE_KINDS.has(ref.referenceKind) || NON_SYMBOL_KINDS.has(candidate.kind)) return true;
+    const file = dotnetFileScopeOf(ref, context, dotnetScope);
+    return file !== null && isFsharpReachableFromDotnet(file, ref.referenceName, scopeOfCandidate(candidate, context));
+  }
   // A Razor component is not something F# names.
   if (candidate.language === 'razor') return false;
   if (!SCOPED_LANGUAGES.has(candidate.language)) return true;

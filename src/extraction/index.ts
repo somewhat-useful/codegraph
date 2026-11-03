@@ -24,7 +24,7 @@ import { ParseWorkerPool, parseWindowSize, resolveParsePoolSize, resolveParseTim
 import { StoreWriter, StoreBundle, finalizeStoreBundle } from './store-writer';
 import { materializeKernelResult } from './kernel';
 import { detectGeneratedFile } from './generated-detection';
-import { detectLanguage, isSourceFile, isLanguageSupported, isFileLevelOnlyLanguage, initGrammars, loadGrammarsForLanguages, readGrammarWasmBytes, isForeignToExtension, hasFsExtension, looksLikeFsharp, FSHARP_SNIFF_BYTES, hasGrammarLoadFailure } from './grammars';
+import { detectLanguage, isSourceFile, isLanguageSupported, isFileLevelOnlyLanguage, initGrammars, loadGrammarsForLanguages, readGrammarWasmBytes, isForeignToExtension, hasFsExtension, FSHARP_SNIFF_BYTES, hasGrammarLoadFailure } from './grammars';
 import { loadExtensionOverrides, loadIncludeIgnoredPatterns, loadExcludePatterns, loadIncludePatterns, PROJECT_CONFIG_FILENAME } from '../project-config';
 import { isCodeGraphDataDir } from '../directory';
 import { logDebug, logWarn } from '../errors';
@@ -1011,7 +1011,7 @@ export function preloadLanguagesForFiles(
     if (hasFsExtension(f) && !(overrides && overrides['.fs'])) fsFiles.push(f);
     else detected.add(detectLanguage(f, undefined, overrides, rootDir));
   }
-  if (!detected.has('fsharp') && fsFiles.some((f) => fsharpHeadAt(rootDir === undefined ? f : path.join(rootDir, f)))) {
+  if (!detected.has('fsharp') && fsFiles.some((f) => fsharpHeadAt(f, rootDir === undefined ? f : path.join(rootDir, f)))) {
     detected.add('fsharp');
   }
   const languages = [...detected];
@@ -1038,16 +1038,17 @@ export function preloadLanguagesForFiles(
 let fsharpHeadBuffer: Buffer | null = null;
 
 /**
- * Whether the `.fs` file at `fullPath` may be F#, from its head. A file that
- * can't be read is not: it isn't parsed either, so it needs no grammar.
+ * Whether the `.fs` file `filePath` (read at `fullPath`) is F#, by its head and
+ * the same gate its reader applies (`isForeignToExtension`). A file that can't
+ * be read is not: it isn't parsed either, so it needs no grammar.
  */
-function fsharpHeadAt(fullPath: string): boolean {
+function fsharpHeadAt(filePath: string, fullPath: string): boolean {
   fsharpHeadBuffer ??= Buffer.allocUnsafe(FSHARP_SNIFF_BYTES);
   let fd: number | undefined;
   try {
     fd = fs.openSync(fullPath, 'r');
     const read = fs.readSync(fd, fsharpHeadBuffer, 0, FSHARP_SNIFF_BYTES, 0);
-    return looksLikeFsharp(fsharpHeadBuffer.toString('utf8', 0, read));
+    return isForeignToExtension(filePath, fsharpHeadBuffer.subarray(0, read)) === null;
   } catch {
     return false;
   } finally {

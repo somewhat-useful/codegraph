@@ -89,13 +89,14 @@ function getDefnSignature(left: SyntaxNode, ret: SyntaxNode | undefined, source:
   return retText ? `${paramsText} : ${retText}` : paramsText;
 }
 
+/** The modifier keywords `leadingKeywords` reports, in the order it reports them. */
+const MODIFIER_KEYWORDS = ['rec', 'inline', 'mutable', 'static', 'abstract', 'override', 'default'] as const;
+const MODIFIER_KEYWORD_RE = new RegExp(`\\b(?:${MODIFIER_KEYWORDS.join('|')})\\b`, 'g');
+
 /** Modifier keywords (`static`, `rec`, `override`, ...) found in the text that precedes a declaration's name. */
 function leadingKeywords(prefix: string): string[] {
-  const found: string[] = [];
-  for (const kw of ['rec', 'inline', 'mutable', 'static', 'abstract', 'override', 'default']) {
-    if (new RegExp(`\\b${kw}\\b`).test(prefix)) found.push(kw);
-  }
-  return found;
+  const written = new Set(prefix.match(MODIFIER_KEYWORD_RE) ?? []);
+  return MODIFIER_KEYWORDS.filter((kw) => written.has(kw));
 }
 
 /** Pipes: `x |> f 1` is extracted from the infix itself, so an application over it is not a second call. */
@@ -229,53 +230,78 @@ function collectPatternNames(node: SyntaxNode, source: string, into: Set<string>
   for (const c of node.namedChildren) collectPatternNames(c, source, into);
 }
 
+/** The names a scope node binds for the code inside it, and whether only its `in` continuation sees them. */
+interface ScopeNames {
+  names: ReadonlySet<string>;
+  continuationOnly: boolean;
+}
+
+const NO_NAMES: ScopeNames = { names: new Set(), continuationOnly: false };
+
+/** Per parse tree, what each scope node binds: every bare call asks for every scope around it. */
+const SCOPE_NAMES = new WeakMap<object, Map<number, ScopeNames>>();
+
+/** What `p` binds for the code inside it: parameters, a local `let`, a recursive local function's own name. */
+function scopeNamesOf(p: SyntaxNode, source: string): ScopeNames {
+  let perTree = SCOPE_NAMES.get(p.tree);
+  if (!perTree) SCOPE_NAMES.set(p.tree, (perTree = new Map()));
+  const hit = perTree.get(p.id);
+  if (hit) return hit;
+  const names = new Set<string>();
+  let continuationOnly = false;
+  if (p.type === 'function_or_value_defn') {
+    for (const left of p.namedChildren) {
+      if (left.type !== 'function_declaration_left' && left.type !== 'value_declaration_left') continue;
+      const own = new Set<string>(getBoundNames(left, source));
+      collectPatternNames(left, source, names);
+      for (const n of own) names.delete(n);
+      // A recursive local function refers to itself in its initializer.
+      // Local definitions are not indexed as module-level symbols.
+      if (leadingKeywords(source.slice(p.startIndex, left.startIndex)).includes('rec')) {
+        for (let outer = p.parent; outer; outer = outer.parent) {
+          if (outer.type === 'function_or_value_defn' || outer.type === 'method_or_prop_defn' || outer.type === 'fun_expression') {
+            for (const n of own) names.add(n);
+            break;
+          }
+          if (outer.type === 'named_module' || outer.type === 'module_defn' || outer.type === 'type_definition') break;
+        }
+      }
+    }
+  } else if (p.type === 'fun_expression') {
+    for (const c of p.namedChildren) if (c.type === 'argument_patterns') collectPatternNames(c, source, names);
+  } else if (p.type === 'declaration_expression') {
+    // A local let is visible in its continuation, but not in its own
+    // non-recursive initializer or outside this expression.
+    continuationOnly = true;
+    for (const binding of p.namedChildren) {
+      if (binding.type !== 'function_or_value_defn') continue;
+      for (const { left } of splitBindings(binding)) {
+        for (const bound of getBoundNames(left, source)) names.add(bound);
+      }
+    }
+  } else if (p.type === 'method_or_prop_defn') {
+    for (const c of p.namedChildren.slice(1, -1)) collectPatternNames(c, source, names);
+  } else {
+    // Primary-constructor parameters stay in scope throughout the type.
+    const constructorArgs = childOfTypes(p, 'primary_constr_args');
+    if (constructorArgs) collectPatternNames(constructorArgs, source, names);
+  }
+  const scope = names.size === 0 ? NO_NAMES : { names, continuationOnly };
+  perTree.set(p.id, scope);
+  return scope;
+}
+
 /**
  * Is `name` a parameter of a function or lambda around `node`? Then `f x` calls
  * the parameter, not a module-level `f`.
  */
 function isParameterOf(node: SyntaxNode, name: string, source: string): boolean {
   for (let p = node.parent; p; p = p.parent) {
-    const params = new Set<string>();
-    if (p.type === 'function_or_value_defn') {
-      for (const left of p.namedChildren) {
-        if (left.type !== 'function_declaration_left' && left.type !== 'value_declaration_left') continue;
-        const own = new Set<string>();
-        collectPatternNames(left, source, params);
-        for (const n of getBoundNames(left, source)) own.add(n);
-        for (const n of own) params.delete(n);
-        // A recursive local function refers to itself in its initializer.
-        // Local definitions are not indexed as module-level symbols.
-        if (leadingKeywords(source.slice(p.startIndex, left.startIndex)).includes('rec')) {
-          for (let outer = p.parent; outer; outer = outer.parent) {
-            if (outer.type === 'function_or_value_defn' || outer.type === 'method_or_prop_defn' || outer.type === 'fun_expression') {
-              for (const n of own) params.add(n);
-              break;
-            }
-            if (outer.type === 'named_module' || outer.type === 'module_defn' || outer.type === 'type_definition') break;
-          }
-        }
-      }
-    } else if (p.type === 'fun_expression') {
-      for (const c of p.namedChildren) if (c.type === 'argument_patterns') collectPatternNames(c, source, params);
-    } else if (p.type === 'declaration_expression') {
-      // A local let is visible in its continuation, but not in its own
-      // non-recursive initializer or outside this expression.
-      const continuation = p.childForFieldName('in');
-      if (continuation && node.startIndex >= continuation.startIndex && node.endIndex <= continuation.endIndex) {
-        for (const binding of p.namedChildren) {
-          if (binding.type !== 'function_or_value_defn') continue;
-          for (const { left } of splitBindings(binding)) {
-            for (const bound of getBoundNames(left, source)) params.add(bound);
-          }
-        }
-      }
-    } else if (childOfTypes(p, 'primary_constr_args')) {
-      // Primary-constructor parameters stay in scope throughout the type.
-      collectPatternNames(childOfTypes(p, 'primary_constr_args')!, source, params);
-    } else if (p.type === 'method_or_prop_defn') {
-      for (const c of p.namedChildren.slice(1, -1)) collectPatternNames(c, source, params);
-    }
-    if (params.has(name)) return true;
+    const scope = scopeNamesOf(p, source);
+    if (!scope.names.has(name)) continue;
+    if (!scope.continuationOnly) return true;
+    const continuation = p.childForFieldName('in');
+    if (continuation && node.startIndex >= continuation.startIndex && node.endIndex <= continuation.endIndex) return true;
   }
   return false;
 }
@@ -392,7 +418,7 @@ function addTypeReferences(ctx: ExtractorContext, ownerId: string, root: SyntaxN
     if (n.type === 'attributes') continue;
     if (n.type === 'simple_type' || n.type === 'generic_type') {
       const name = typeRefName(n, ctx.source);
-      if (name && /^[A-Z]/.test(name) && !seen.has(name)) {
+      if (name && /^\p{Lu}/u.test(name) && !seen.has(name)) {
         seen.add(name);
         ctx.addUnresolvedReference({
           fromNodeId: ownerId,
@@ -444,6 +470,43 @@ function getOperatorCallee(node: SyntaxNode, source: string): string | null {
   const text = op ? txt(op, source) : '';
   return text && !STANDARD_OPERATORS.has(text) ? `(${text})` : null;
 }
+
+/**
+ * `module A = X.Y`, whichever node the grammar reads it as: an import named
+ * `A` whose signature is the path it stands for (what the resolver's alias
+ * expansion reads), and an `imports` reference to that path.
+ */
+function addModuleAlias(ctx: ExtractorContext, alias: string, target: SyntaxNode, at: SyntaxNode): void {
+  const path = txt(target, ctx.source);
+  if (!ctx.createNode('import', alias, at, { signature: path.slice(0, 100) })) return;
+  ctx.addUnresolvedReference({
+    fromNodeId: topScopeId(ctx),
+    referenceName: path,
+    referenceKind: 'imports',
+    line: at.startPosition.row + 1,
+    column: at.startPosition.column,
+  });
+}
+
+/** Where code written straight in a file, namespace or module sits: what runs it is that scope. */
+const TOP_LEVEL_SCOPES: ReadonlySet<string> = new Set(['file', 'named_module', 'module_defn', 'namespace']);
+
+/** Expressions that run where they are written: a script's `build ()`, `xs |> run`, a module's initialisation. */
+const TOP_LEVEL_EXPRESSIONS: ReadonlySet<string> = new Set([
+  'application_expression',
+  'infix_expression',
+  'dot_expression',
+  'paren_expression',
+  'sequential_expression',
+  'if_expression',
+  'match_expression',
+  'for_expression',
+  'while_expression',
+  'try_expression',
+  'ce_expression',
+  'prefixed_expression',
+  'typed_expression',
+]);
 
 function topScopeId(ctx: ExtractorContext): string {
   return ctx.nodeStack.length > 0 ? (ctx.nodeStack[ctx.nodeStack.length - 1] ?? '') : '';
@@ -857,7 +920,8 @@ function handleBinding(
   // The first binding sits where its `let` does; the ones joined by `and` where their own name does.
   const anchor = first ? defn : left;
   const created = ctx.createNode(isFunction ? kinds.function : kinds.value, symbolName, anchor, extra);
-  // A destructuring binding introduces several names, each initialised by the same body.
+  // A destructuring binding introduces several names, each initialised by the same body:
+  // each depends on what it calls, so `codegraph_node y` of `let x, y = make ()` shows `make`.
   const introduced = [created, ...boundNames.slice(1).map((other) => ctx.createNode(kinds.value, other, anchor, extra))];
   for (const symbol of introduced) {
     if (!symbol) continue;
@@ -906,6 +970,8 @@ export const fsharpExtractor: LanguageExtractor = {
   nameField: '',
   bodyField: '',
   paramsField: '',
+  // The offside scanner asks for a column on nearly every token.
+  parseInChunks: true,
 
   extractBareCall: (node, source) => {
     if (node.type === 'application_expression') return getCalleeName(node, source) ?? undefined;
@@ -960,19 +1026,7 @@ export const fsharpExtractor: LanguageExtractor = {
         block !== null && (block.type === 'long_identifier' || block.type === 'long_identifier_or_op' || block.type === 'dot_expression');
 
       if (isAbbreviation) {
-        const target = txt(block, source);
-        const impNode = ctx.createNode('import', moduleName, node, {
-          signature: target.slice(0, 100),
-        });
-        if (impNode) {
-          ctx.addUnresolvedReference({
-            fromNodeId: topScopeId(ctx),
-            referenceName: target,
-            referenceKind: 'imports',
-            line: node.startPosition.row + 1,
-            column: node.startPosition.column,
-          });
-        }
+        addModuleAlias(ctx, moduleName, block, node);
         return true;
       }
 
@@ -1010,15 +1064,7 @@ export const fsharpExtractor: LanguageExtractor = {
       const aliasNode = node.namedChildren.find((c) => NAME_NODES.has(c.type));
       const block = node.childForFieldName('block');
       if (!aliasNode || !block) return false;
-      const target = txt(block, source);
-      ctx.createNode('import', txt(aliasNode, source), node, { signature: target.slice(0, 100) });
-      ctx.addUnresolvedReference({
-        fromNodeId: topScopeId(ctx),
-        referenceName: target,
-        referenceKind: 'imports',
-        line: node.startPosition.row + 1,
-        column: node.startPosition.column,
-      });
+      addModuleAlias(ctx, txt(aliasNode, source), block, node);
       return true;
     }
 
@@ -1041,11 +1087,11 @@ export const fsharpExtractor: LanguageExtractor = {
       return true;
     }
 
-    if (node.type === 'infix_expression') {
-      const binding = readAndBinding(node, source);
-      if (!binding) return false;
-      const name = txt(binding.name, source);
-      if (!name) return false;
+    // --- `and` bindings, which the grammar reads as an infix `=` ---
+
+    const binding = node.type === 'infix_expression' ? readAndBinding(node, source) : null;
+    const name = binding ? txt(binding.name, source) : '';
+    if (binding && name) {
       const isFunction = binding.params.length > 0;
       const created = ctx.createNode(isFunction ? 'function' : 'variable', name, node, {
         signature: isFunction ? binding.params.map((p) => txt(p, source)).join(' ') : undefined,
@@ -1127,6 +1173,13 @@ export const fsharpExtractor: LanguageExtractor = {
         signature: txt(node, source).slice(0, 100),
         isExported: true,
       });
+      return true;
+    }
+
+    // --- Code written straight in a file, namespace or module: it runs there ---
+
+    if (TOP_LEVEL_EXPRESSIONS.has(node.type) && node.parent !== null && TOP_LEVEL_SCOPES.has(node.parent.type)) {
+      visitBody(ctx, node, topScopeId(ctx));
       return true;
     }
 

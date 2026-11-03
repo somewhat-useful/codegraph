@@ -81,6 +81,13 @@ export interface LanguageExtractor {
    */
   preParse?: (source: string, filePath?: string) => string;
   /**
+   * Hand the parser the source in small chunks instead of as one string. A
+   * grammar whose external scanner asks for the column of nearly every token
+   * (F#'s offside rule) makes the wasm parser walk its input chunk from the
+   * start on each ask: quadratic over one whole-file chunk.
+   */
+  parseInChunks?: boolean;
+  /**
    * Read `getSignature` from the source as the file has it, not from
    * `preParse`'s output, when the preParse blanks syntax a reader of the
    * signature still wants: a Delphi parameter's attribute, `const [ref] AValue`

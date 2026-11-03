@@ -105,11 +105,12 @@ const ERLANG_MFA_CALLS = new Set([
 ]);
 
 /**
- * The source as the parser's input callback, in small chunks. The F# grammar's
- * external scanner asks for the column of nearly every token, and each ask makes
- * the wasm parser walk the string it was handed from the start of its chunk: with
- * the whole file as one chunk that is quadratic, and parsing real F# takes 2.5 times
- * as long as with 128-character chunks.
+ * The source as the parser's input callback, in small chunks, for a grammar
+ * that sets `parseInChunks`. Its external scanner asks for the column of nearly
+ * every token, and each ask makes the wasm parser walk the string it was handed
+ * from the start of its chunk: with the whole file as one chunk that is
+ * quadratic, and parsing real F# takes 2.5 times as long as with 128-character
+ * chunks.
  */
 function inChunks(source: string): (index: number) => string {
   return (index) => {
@@ -1042,7 +1043,7 @@ export class TreeSitterExtractor {
         if (preParsed !== this.source) this.sourceAsWritten = this.source;
         this.source = preParsed;
       }
-      this.tree = parser.parse(this.language === 'fsharp' ? inChunks(this.source) : this.source) ?? null;
+      this.tree = parser.parse(this.extractor?.parseInChunks ? inChunks(this.source) : this.source) ?? null;
       if (!this.tree) {
         throw new Error('Parser returned null tree');
       }

@@ -15,7 +15,7 @@ import { JS_ARRAY_METHODS, JS_BROWSER_HOST_GLOBALS, JS_BUILT_INS, JS_BUILTIN_MET
 import { SWIFT_TYPE_PATH_CALL, resolveSwiftTypePathCall } from './swift-type-visibility';
 import { dartImportPrefixes, dartLibrarySees, dartPrefixSees, dartPrivateVisible, inSameDartLibrary } from './dart-libraries';
 import { isDartLocallyBound } from './dart-local-scope';
-import { breakVbTie, isVbMemberInScope, isVbNestedTypeInScope, isVbTypeQualifiedBy, matchVbTypedCall, preferVbProject, sameVbProject } from './vbnet-receivers';
+import { breakVbTie, isVbMemberInScope, isVbNestedTypeInScope, isVbTypeQualifiedBy, matchVbTypedCall, preferVbProject, sameVbProject, vbImportScope } from './vbnet-receivers';
 import { cppAliasedClass, cppAliasedTypeName, cppAliasedTypeWritten, cppDeclaresLocalAlias, cppParentScope, cppScopesWithin, cppTemplateArguments, cppTemplateParameters, cppTypeNamesDeclared, cppTypeSegments, isCppPointerType, resolveCppAliasedType, stripCppTemplateArguments, type CppAliasedType } from './cpp-type-aliases';
 import { clearCppNamespaceMemos, cppMacroNamespaceFrames, cppMacroNamespaceHeads, cppNameMacros, cppNamespaceAliases } from './cpp-namespaces';
 import { clearCppRawStringMemos, cppLiteralsBlanked, cppNonCodeLines } from './cpp-raw-strings';
@@ -28,7 +28,7 @@ import { leavesWorkspaceRoot } from './workspace-packages';
 import { isMinifiedContent } from '../extraction/generated-detection';
 import { getCargoWorkspaceCrateMap, parsePackageName, parseTargetPaths, parseWorkspaceMembers } from './frameworks/cargo-workspace';
 import { blankRustCode, readRustScopes, rustBindingAt, rustInnerBlockAt, rustBoundsOf, rustFnAt, rustImplAt, splitRustTopLevel, type RustBinding, type RustPatternSite, type RustScopes } from './rust-scopes';
-import { isFsharpCandidateInScope, clearFsharpScopeCaches } from './fsharp-scope';
+import { isFsharpCandidateInScope, clearFsharpScopeCaches, matchDotnetNameInFsharp, type DotnetFileScope } from './fsharp-scope';
 /**
  * Ceiling on how many same-named definitions a FUZZY name-match strategy will
  * score. A name defined more times than this is "ubiquitous" — a method/symbol
@@ -4217,7 +4217,7 @@ export function isVisibleAcrossFiles(candidate: Node, ref: UnresolvedRef, contex
   // A bare Java type name is its package's, an import's, or a nested type in reach.
   if (!isJavaTypeVisible(candidate, ref, context)) return false;
   // An F# name is its file's, its enclosing namespace or module's, or an opened one's.
-  if (!isFsharpCandidateInScope(candidate, ref, context)) return false;
+  if (!isFsharpCandidateInScope(candidate, ref, context, dotnetScopeForFsharp)) return false;
   // A Dart `extension on Token { … }` has no name: `Token` is analyzer's type,
   // not bloc_lint's extension block (84 refs went there).
   if (dartExtensionDecl(candidate, context)?.named === false) return false;
@@ -8057,6 +8057,28 @@ function csharpNamespaceScope(file: string, context: ResolutionContext): { names
   const scope = { namespaces, usings, aliases };
   memo.set(file, scope);
   return scope;
+}
+
+/**
+ * What a C# or VB.NET file can name, for F#'s check of a name it writes
+ * (`isFsharpReachableFromDotnet`): the same namespaces, usings and aliases the
+ * C# and VB.NET lookups here use, and the full paths of its `using static`.
+ */
+function dotnetScopeForFsharp(ref: UnresolvedRef, context: ResolutionContext): DotnetFileScope | null {
+  if (ref.language === 'csharp') {
+    const scope = csharpNamespaceScope(ref.filePath, context);
+    const statics = new Set<string>();
+    const text = stripCommentsForRegex(context.readFile(ref.filePath) ?? '', 'java');
+    for (const m of text.matchAll(/^\s*(?:global\s+)?using\s+static\s+(?:global::)?([\w.]+)\s*;/gm)) statics.add(m[1]!);
+    return { namespaces: scope.namespaces, usings: scope.usings, aliases: scope.aliases, statics, ignoreCase: false };
+  }
+  if (ref.language === 'vbnet') {
+    // VB.NET imports a module or type as it imports a namespace: its shared members are then seen bare.
+    const scope = vbImportScope(ref.filePath, context);
+    const imports = new Set(scope.imports);
+    return { namespaces: scope.namespaces, usings: imports, aliases: scope.aliases, statics: imports, ignoreCase: true };
+  }
+  return null;
 }
 
 /**
@@ -14514,7 +14536,7 @@ export function matchByExactName(
     (n.language !== 'go' || isGoNameVisible(n, ref, context)) &&
     // An F# name is its file's, its scope's, an opened or a qualified one: ahead of
     // the ranking, so the namesake in reach wins over one in an unreached namespace.
-    isFsharpCandidateInScope(n, ref, context) &&
+    isFsharpCandidateInScope(n, ref, context, dotnetScopeForFsharp) &&
     dartExtensionDecl(n, context)?.named !== false &&
     // A Scala package object's member, only where it is in scope — ahead of
     // the ranking, so cats.laws' `Eq` can be the `cats` package object's.
@@ -32717,6 +32739,14 @@ function matchReferenceInner(
   // 2. Method call pattern
   result = nmTimed('methodCall', ref, () => matchMethodCall(ref, context));
   if (result) return result;
+
+  // 2b. A C# or VB.NET name of an F# declaration: an F# module is a static
+  // class to them, its functions no class's methods, so the strategies above
+  // never find them. After their own lookup, so a C# or VB.NET namesake wins.
+  if (ref.language === 'csharp' || ref.language === 'vbnet') {
+    result = nmTimed('dotnetToFsharp', ref, () => matchDotnetNameInFsharp(ref, context, dotnetScopeForFsharp));
+    if (result) return result;
+  }
 
   // 3. Exact name match
   result = nmTimed('exactName', ref, () => matchByExactName(ref, context));

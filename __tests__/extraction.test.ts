@@ -989,6 +989,23 @@ let total (o: Order) (rate: Rate) : Money = Money 0
     const result = extractFromSource('build.fsx', '#r "nuget: Foo"\n#load "Helpers.fsx"\nopen Helpers\n');
     expect(refs(result, 'imports')).toEqual(['Helpers.fsx', 'Helpers']);
   });
+
+  it('should extract the calls a script or a module makes at its top level', () => {
+    const script = extractFromSource('build.fsx', 'let build () = 1\nlet test () = 2\nbuild ()\ntest () |> ignore\nTarget.runOrDefault "All"\n');
+    expect(refs(script, 'calls')).toEqual(expect.arrayContaining(['build', 'test', 'runOrDefault']));
+    const fileNode = script.nodes.find((n) => n.kind === 'file')!;
+    expect(script.unresolvedReferences.filter((r) => r.referenceName === 'build').map((r) => r.fromNodeId)).toEqual([fileNode.id]);
+
+    const module = extractFromSource('M.fs', 'module M\nlet f () = 1\nf ()\nmodule Inner =\n    let g () = 2\n    g ()\n');
+    const owner = (name: string) => module.nodes.find((n) => n.id === module.unresolvedReferences.find((r) => r.referenceName === name)?.fromNodeId)?.qualifiedName;
+    expect(owner('f')).toBe('M');
+    expect(owner('g')).toBe('M::Inner');
+  });
+
+  it('should reference a type whose name starts with a non-ASCII capital', () => {
+    const result = extractFromSource('M.fs', 'module M\ntype Ä = { V: int }\nlet f (x: Ä) = x\n');
+    expect(refs(result, 'references')).toContain('Ä');
+  });
 });
 
 describe('TypeScript Extraction', () => {
