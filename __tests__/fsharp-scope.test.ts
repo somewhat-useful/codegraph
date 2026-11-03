@@ -1133,6 +1133,34 @@ let parse s =
     public int Run(int x) { return Dom.Calculate(x); }
 }
 `,
+      'Calc.fs': `namespace Calc
+
+type Repo() =
+    static member Make() = Repo()
+
+type Base(n: int) =
+    abstract Speak : unit -> string
+    default _.Speak() = "base"
+
+type Derived(n) =
+    inherit Base(n)
+    override x.Speak() = base.Speak() + "!"
+
+module Ops =
+    [<Literal>]
+    let Limit = 10
+    let inc x = x + 1
+`,
+      'UseCalc.fs': `module UseCalc
+
+open Calc
+open type Calc.Repo
+
+let viaOpenType () = Make()
+let backPipe () = Ops.inc <| 1
+let composed = Ops.inc >> Ops.inc
+let limit () = Ops.Limit
+`,
     };
     for (const [rel, content] of Object.entries(files)) fs.writeFileSync(path.join(dir, rel), content);
     project = await CodeGraph.init(dir, { index: true });
@@ -1168,6 +1196,22 @@ let parse s =
   it('links an active pattern\'s cases where a match uses them', () => {
     expect(edgesOf('App.fs', 'classify', 'references').sort()).toEqual(['Dom::(|Even|Odd|)::Even', 'Dom::(|Even|Odd|)::Odd']);
     expect(edgesOf('App.fs', 'parse', 'references')).toEqual(['Dom::(|Int|_|)::Int']);
+  });
+
+  it('brings a type\'s static members into scope with `open type`', () => {
+    expect(edgesOf('UseCalc.fs', 'viaOpenType', 'calls')).toEqual(['Calc::Repo::Make']);
+  });
+
+  it('calls what `<|` applies, and references what `>>` composes and a value read', () => {
+    expect(edgesOf('UseCalc.fs', 'backPipe', 'calls')).toEqual(['Calc::Ops::inc']);
+    expect(edgesOf('UseCalc.fs', 'composed', 'references')).toEqual(['Calc::Ops::inc', 'Calc::Ops::inc']);
+    expect(edgesOf('UseCalc.fs', 'limit', 'references')).toEqual(['Calc::Ops::Limit']);
+  });
+
+  it('links `base.M()` to the member of the type inherited', () => {
+    const speak = project.getNodesInFile('Calc.fs').find((n) => n.qualifiedName === 'Calc::Derived::Speak')!;
+    expect(project.getOutgoingEdgesFrom([speak.id]).filter((e) => e.kind === 'calls').map((e) => project.getNode(e.target)!.qualifiedName))
+      .toEqual(['Calc::Base::Speak']);
   });
 
   it('links a C# call by a `[<CompiledName>]` no F# name resembles', () => {

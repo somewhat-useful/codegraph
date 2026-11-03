@@ -1259,8 +1259,9 @@ export const fsharpExtractor: LanguageExtractor = {
       const importName = nameNode ? txt(nameNode, source) : '';
       if (!importName) return false;
       // `open` names a namespace or module wherever it is written; the
-      // enclosing scope is not part of that name.
-      ctx.createNode('import', importName, node, { qualifiedName: importName });
+      // enclosing scope is not part of that name. `open type T` opens a type: its static members.
+      const openType = /^open\s+type\b/.test(txt(node, source));
+      ctx.createNode('import', importName, node, { qualifiedName: importName, ...(openType ? { decorators: ['type'] } : {}) });
       ctx.addUnresolvedReference({
         fromNodeId: topScopeId(ctx),
         referenceName: importName,

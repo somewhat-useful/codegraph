@@ -75,6 +75,8 @@ export interface FsharpRefScope {
   namespace: string;
   /** Paths the file opens. */
   opens: readonly string[];
+  /** Types the file opens with `open type`: their static members, nested types and union cases are in scope bare. */
+  openTypes?: readonly string[];
   /** Qualifiers the name is written with, aliases expanded: `Calc` in `Calc.helper`, `x` in `x.Add`. */
   qualifiers: readonly string[];
   /** The name is written through a capitalised path whose head the project does not declare: `System.Threading.Tasks.Task.Run`. */
@@ -103,6 +105,8 @@ export interface FsharpCandidateScope {
   autoOpened: readonly string[];
   /** A class's `let` binding: in scope bare inside its type, where the type's members are not. */
   classLet?: boolean;
+  /** A static member, which `open type` brings into scope bare. */
+  isStatic?: boolean;
 }
 
 /**
@@ -169,16 +173,19 @@ function openedPaths(prefixes: readonly string[], opens: readonly { name: string
   return out;
 }
 
-const RESOLVED_SCOPES = new WeakMap<FsharpRefScope, { prefixes: string[]; opens: Set<string> }>();
+const RESOLVED_SCOPES = new WeakMap<FsharpRefScope, { prefixes: string[]; opens: Set<string>; openTypes: Set<string> }>();
 
 /** The scopes around a reference and its opens, the latter also read relative to those scopes (`open Core` in `namespace Shop`). */
-function resolvedScopes(ref: FsharpRefScope): { prefixes: string[]; opens: Set<string> } {
+function resolvedScopes(ref: FsharpRefScope): { prefixes: string[]; opens: Set<string>; openTypes: Set<string> } {
   const cached = RESOLVED_SCOPES.get(ref);
   if (cached) return cached;
   const prefixes = scopePrefixes(ref.container);
   const opens = new Set<string>();
   for (const { path } of openedPaths(prefixes, ref.opens.map((name) => ({ name, line: 0 })))) opens.add(path);
-  const resolved = { prefixes, opens };
+  // `open type T` names `T` as written, relative to the scopes around the reference and to what is opened.
+  const openTypes = new Set<string>();
+  for (const name of ref.openTypes ?? []) for (const base of [...prefixes, ...opens]) openTypes.add(joinPath(base, name));
+  const resolved = { prefixes, opens, openTypes };
   RESOLVED_SCOPES.set(ref, resolved);
   return resolved;
 }
@@ -192,7 +199,7 @@ export function isFsharpCandidateReachable(ref: FsharpRefScope, candidate: Fshar
   if (c === '') return false;
   if (c === GLOBAL_NAMESPACE) return true;
 
-  const { prefixes, opens } = resolvedScopes(ref);
+  const { prefixes, opens, openTypes } = resolvedScopes(ref);
   const isMember = MEMBER_KINDS.has(candidate.kind);
 
   // What a qualifier can start from: the scopes around the reference, its opens, and
@@ -220,8 +227,8 @@ export function isFsharpCandidateReachable(ref: FsharpRefScope, candidate: Fshar
   // Bare name: a member is never in scope — inside its own type too, where it is reached
   // through the self identifier (`this.M`) — but a class's `let` is, inside that type;
   // anything else only through an enclosing scope or an opened one.
-  if (isMember) return candidate.classLet === true && sameFile && isPathPrefix(c, ref.container);
-  return candidate.holders.some((h) => opens.has(h) || isPathPrefix(h, ref.container));
+  if (isMember) return (candidate.classLet === true && sameFile && isPathPrefix(c, ref.container)) || (candidate.isStatic === true && openTypes.has(c));
+  return openTypes.has(c) || candidate.holders.some((h) => opens.has(h) || isPathPrefix(h, ref.container));
 }
 
 /**
@@ -333,6 +340,8 @@ export function isFsharpReachableFromDotnet(file: DotnetFileScope, written: stri
 interface FileScope {
   /** Paths the file opens: `open X`. */
   opens: { node: Node; owner?: Node }[];
+  /** Types the file opens: `open type X`. */
+  openTypes: { node: Node; owner?: Node }[];
   /** Module abbreviations, with the lexical scope that owns them. */
   aliases: { node: Node; owner?: Node }[];
   /** Namespaces, modules and enums of the file by their qualified name. */
@@ -360,7 +369,7 @@ function fileScopeOf(filePath: string, context: ResolutionContext): FileScope {
   if (!perFile) FILE_SCOPES.set(context, (perFile = new Map()));
   const cached = perFile.get(filePath);
   if (cached) return cached;
-  const scope: FileScope = { opens: [], aliases: [], scopes: new Map(), byPath: new Map() };
+  const scope: FileScope = { opens: [], openTypes: [], aliases: [], scopes: new Map(), byPath: new Map() };
   const nodes = context.getNodesInFile(filePath);
   const containers = nodes.filter((n) => n.kind === 'module' || n.kind === 'namespace');
   for (const n of nodes) {
@@ -374,6 +383,7 @@ function fileScopeOf(filePath: string, context: ResolutionContext): FileScope {
     const owner = containers.filter((c) => containsPosition(c, n.startLine, n.startColumn))
       .sort((a, b) => b.startLine - a.startLine || b.startColumn - a.startColumn)[0];
     if (n.signature) scope.aliases.push({ node: n, owner });
+    else if (n.decorators?.includes('type')) scope.openTypes.push({ node: n, owner });
     // `#load "a.fsx"` is an import node too, but names a file, not a scope.
     else if (!/[.]fsx?$/i.test(n.name)) scope.opens.push({ node: n, owner });
   }
@@ -509,6 +519,7 @@ function scopeOfRef(ref: UnresolvedRef, context: ResolutionContext): FsharpRefSc
     container,
     namespace: from && from.kind !== 'file' ? declaredNamespace(from, context) : '',
     opens: file.opens.filter((entry) => importApplies(entry, ref)).map(({ node }) => node.name),
+    openTypes: file.openTypes.filter((entry) => importApplies(entry, ref)).map(({ node }) => node.name),
     qualifiers,
     externalQualifier: qualifiers.length > 0 && qualifiers.every((q) => isExternalPath(q, context)),
   };
@@ -528,6 +539,8 @@ const TYPE_NAME = String.raw`([A-Za-z_\x60][\w.\x60']*)`;
  * name of the member the value is used with.
  */
 function receiversOf(written: string, ref: UnresolvedRef, from: Node | undefined, scope: FsharpRefScope, context: ResolutionContext): string[] | null {
+  // `base.Speak()` in a member is the inherited type's member: the supertypes of the type it is declared in.
+  if (written === 'base') return from && MEMBER_KINDS.has(from.kind) ? baseTypesOf(containerOfNode(from), context) : null;
   const typeName = written.includes('.') ? pathValueType(written, scope, context) : localValueType(written, ref, from, context);
   if (typeName === null) return null;
   const types = typeName.kind === 'path' ? [typeName.path] : reachableTypes(typeName.name, scope, context);
@@ -544,6 +557,22 @@ function receiversOf(written: string, ref: UnresolvedRef, from: Node | undefined
     else visit(type, 0);
   }
   return [...paths];
+}
+
+/** The dotted paths of what the type at `path` inherits or implements, and what those do in turn. */
+function baseTypesOf(path: string, context: ResolutionContext): string[] | null {
+  const types = context.getNodesByQualifiedName(path.split('.').join('::')).filter((n) => TYPE_KINDS.has(n.kind) && n.kind !== 'module');
+  const paths = new Set<string>();
+  const visit = (node: Node, depth: number): void => {
+    for (const parent of context.getSupertypeNodes?.(node.id) ?? []) {
+      const parentPath = parent.qualifiedName.split('::').join('.');
+      if (paths.has(parentPath) || depth > 8) continue;
+      paths.add(parentPath);
+      visit(parent, depth + 1);
+    }
+  };
+  for (const type of types) visit(type, 0);
+  return paths.size > 0 ? [...paths] : null;
 }
 
 type ValueType = { kind: 'name'; name: string } | { kind: 'path'; path: string };
@@ -777,6 +806,7 @@ function scopeOfCandidate(candidate: Node, context: ResolutionContext): FsharpCa
     holders: foreign ? [container] : holdersOf(candidate, file),
     autoOpened: foreign ? [] : autoOpenedAround(candidate, file.scopes),
     classLet: !foreign && candidate.decorators?.[0] === 'let',
+    isStatic: candidate.isStatic === true,
   };
   perContext.set(candidate.id, scope);
   return scope;
