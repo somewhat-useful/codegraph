@@ -6,6 +6,7 @@
  * are compiled, keeping V8 WASM memory pressure low on large codebases.
  */
 
+import { hasFsharpCode } from './fsharp-lexer';
 import * as path from 'path';
 import * as fs from 'fs';
 import * as fsp from 'fs/promises';
@@ -362,10 +363,6 @@ export function looksLikeFsharp(head: string): boolean {
   return hasFsharpCode(head);
 }
 
-/** Whether F# source has anything but comments and blank lines. */
-function hasFsharpCode(source: string): boolean {
-  return source.replace(/\(\*[\s\S]*?\*\)|\/\/[^\n]*/g, '').trim() !== '';
-}
 
 /** Decodes a head that may end mid-character: the cut character becomes U+FFFD, which no rule reads. */
 const UTF8 = new TextDecoder('utf-8');

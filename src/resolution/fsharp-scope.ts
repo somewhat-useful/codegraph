@@ -39,6 +39,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import type { Node } from '../types';
 import type { ResolutionContext, ResolvedRef, UnresolvedRef } from './types';
+import { fsharpNames } from '../extraction/fsharp-lexer';
 
 /** Reference kinds that name a declaration (an `open` names a namespace, which is not a symbol). */
 const SYMBOL_REFERENCE_KINDS: ReadonlySet<string> = new Set([
@@ -1344,13 +1345,14 @@ export function matchFsharpRecordConstruction(ref: UnresolvedRef, context: Resol
   return { original: ref, targetNodeId: built[0]!.id, confidence: 0.9, resolvedBy: 'exact-match' };
 }
 
-const COMPILE_ORDERS = new WeakMap<ResolutionContext, Map<string, Map<string, number> | null>>();
+const COMPILE_ORDERS = new WeakMap<ResolutionContext, Map<string, Map<string, number>[]>>();
 
 /**
- * The compilation order of the F# project around `file`: its project file's
- * `<Compile Include>` items, in order, by project-relative path. F# sees in a
- * file only what the files before it in that order declare. Null when no
- * project file above the file lists it.
+ * The compilation order of the F# project that compiles `file`: the nearest
+ * folder at or above it holding `.fsproj` files, and of those the one whose
+ * items list the file (`fsprojCompileItems`), by project-relative path. F#
+ * sees in a file only what the files before it in that order declare. Null
+ * when the nearest project files list it nowhere.
  */
 function compileOrderOf(file: string, context: ResolutionContext): Map<string, number> | null {
   let byDir = COMPILE_ORDERS.get(context);
@@ -1358,36 +1360,38 @@ function compileOrderOf(file: string, context: ResolutionContext): Map<string, n
   const root = context.getProjectRoot();
   for (let dir = path.posix.dirname(file); ; dir = path.posix.dirname(dir)) {
     const key = dir === '.' ? '' : dir;
-    let order = byDir.get(key);
-    if (order === undefined) {
-      order = null;
-      let entries: string[] = [];
-      try {
-        entries = fs.readdirSync(path.join(root, key));
-      } catch {
-        entries = [];
-      }
-      const project = entries.find((e) => /\.fsproj$/i.test(e));
-      if (project) {
-        let text = '';
-        try {
-          text = fs.readFileSync(path.join(root, key, project), 'utf8');
-        } catch {
-          text = '';
-        }
-        order = new Map();
-        let index = 0;
-        for (const item of fsprojCompileItems(text)) {
-          const listed = path.posix.normalize(path.posix.join(key, item));
-          if (!order.has(listed)) order.set(listed, index++);
-        }
-      }
-      byDir.set(key, order);
+    let orders = byDir.get(key);
+    if (orders === undefined) {
+      orders = projectOrdersIn(root, key);
+      byDir.set(key, orders);
     }
-    if (order && order.has(file)) return order;
-    if (order) return null;
+    if (orders.length > 0) return orders.find((order) => order.has(file)) ?? null;
     if (key === '') return null;
   }
+}
+
+/** The compile order of each `.fsproj` in folder `dir`, by project-relative path. */
+function projectOrdersIn(root: string, dir: string): Map<string, number>[] {
+  let entries: string[] = [];
+  try {
+    entries = fs.readdirSync(path.join(root, dir));
+  } catch {
+    entries = [];
+  }
+  return entries.filter((e) => /\.fsproj$/i.test(e)).sort().map((project) => {
+    let text = '';
+    try {
+      text = fs.readFileSync(path.join(root, dir, project), 'utf8');
+    } catch {
+      text = '';
+    }
+    const order = new Map<string, number>();
+    for (const item of fsprojCompileItems(text)) {
+      const listed = path.posix.normalize(path.posix.join(dir, item));
+      if (!order.has(listed)) order.set(listed, order.size);
+    }
+    return order;
+  });
 }
 
 const PRIVATE_SCOPES = new WeakMap<ResolutionContext, Map<string, { path: string; namespace: boolean }[]>>();
@@ -1480,13 +1484,30 @@ function fileLines(filePath: string, context: ResolutionContext): string[] {
  * (`isHiddenBySignature`). A comment or a reordering changes none of them.
  */
 export function signatureNames(text: string): string[] {
-  const code = text.replace(/\(\*[\s\S]*?\*\)|\/\/[^\n]*/g, ' ');
-  return [...new Set(code.match(/``[^`]+``|[\p{L}_][\p{L}\p{N}_']*/gu) ?? [])].sort();
+  return [...new Set(fsharpNames(text))].sort();
 }
 
-/** A project file's `<Compile Include>` items, in order, with `/` separators: what F# compiles, in the order it does. */
+/**
+ * A project file's compile items, with `/` separators, in the order F#
+ * compiles them: `<CompileBefore>`, then `<Compile>`, then `<CompileAfter>`,
+ * each in document order, whatever order the element's attributes are in.
+ */
 export function fsprojCompileItems(text: string): string[] {
-  return [...text.matchAll(/<Compile\s+Include\s*=\s*"([^"*?]+)"/gi)].map((m) => m[1]!.replace(/\\/g, '/'));
+  // What is commented out or quoted as character data is no item.
+  const xml = text.replace(/<!--[\s\S]*?-->/g, '').replace(/<!\[CDATA\[[\s\S]*?\]\]>/g, '');
+  const groups: Record<string, string[]> = { compilebefore: [], compile: [], compileafter: [] };
+  for (const element of xml.matchAll(/<(CompileBefore|CompileAfter|Compile)\b((?:[^>"']|"[^"]*"|'[^']*')*)\/?>/gi)) {
+    const attributes = new Map<string, string>();
+    for (const a of element[2]!.matchAll(/([\w.:-]+)\s*=\s*(?:"([^"]*)"|'([^']*)')/g)) attributes.set(a[1]!.toLowerCase(), a[2] ?? a[3] ?? '');
+    const include = attributes.get('include');
+    if (include === undefined) continue;
+    // `Include="A.fs;B.fs"` lists several; a wildcard or a property names no one file.
+    for (const item of include.split(';').map((i) => i.trim())) {
+      if (item !== '' && !/[*?]|\$\(/.test(item)) groups[element[1]!.toLowerCase()]!.push(item.replace(/\\/g, '/'));
+    }
+  }
+  // F# compiles `CompileBefore` items first and `CompileAfter` items last, around the `Compile` ones.
+  return [...groups.compilebefore!, ...groups.compile!, ...groups.compileafter!];
 }
 
 /**
@@ -1543,13 +1564,14 @@ function isHiddenBySignature(candidate: Node, context: ResolutionContext): boole
   let names = byFile.get(signaturePath);
   if (names === undefined) {
     try {
-      names = new Set(signatureNames(fs.readFileSync(path.join(context.getProjectRoot(), signaturePath), 'utf8')).map((n) => n.replace(/^``|``$/g, '')));
+      names = new Set(signatureNames(fs.readFileSync(path.join(context.getProjectRoot(), signaturePath), 'utf8')));
     } catch {
       names = null;
     }
     byFile.set(signaturePath, names);
   }
-  return names !== null && !names.has(candidate.name.replace(/^``|``$/g, ''));
+  // A declaration's name as the lexer spells it: ``a b`` without its backticks, `( +++ )` without spaces.
+  return names !== null && !names.has(candidate.name.replace(/^``([\s\S]*)``$/, '$1').replace(/^\((.*)\)$/, (_, op: string) => `(${op.replace(/\s+/g, '')})`));
 }
 
 /** Is `candidate` something `ref` can mean? Always true for refs and candidates F# has nothing to say about. */

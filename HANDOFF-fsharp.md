@@ -11,12 +11,13 @@ Branch `fsharp-support-wip` (work in progress). `fsharp-support` = last pushed r
    - Resolver: `candidates` now carried through ref rebuilds (`resolution/index.ts`); dedicated `matchFsharpReference` (F# refs resolve only by F# rules); value types follow `returnType` chains read at the declaration's own scope (`typesOfPath`, `scopeAtNode`); args read at the exact name position; `resolvedScopes` cache keyed by location (perf).
    - Tests: all F# suites pass (959). New tests: `fsharp-scope.test.ts` "as the extractor writes them".
 
+4. **Done:** `src/extraction/fsharp-lexer.ts` — F# lexer (nested `(* *)`, `(*)` operator, strings, char literals, `(op)` and `(|A|B|)` names); used by the `.fs` detector (`hasFsharpCode`) and `.fsi` reading (`signatureNames`). `.fsproj` read as XML: comments/CDATA skipped, attributes in any order, `Include="A;B"`, `CompileBefore`/`Compile`/`CompileAfter` order, the `.fsproj` that lists the file among several in a folder. Tests: `__tests__/fsharp-lexer.test.ts`.
+
 ## Not verified yet
 - Timing after the cached-bindings rewrite (before it: Paket 6.7s → 10s; the rewrite targets the remaining extractor cost). Run: `npm run build`, then index FSharp.Data / Giraffe / Paket.
 - Full `npm test` after this step (only `glyphs.test.ts` fails, also on upstream).
 
 ## Remaining (from last review)
-- `.fsproj` as XML (comments, CompileBefore/After, attribute order); `.fsi` names via a lexer (operators, active patterns, `(*)`); same `(*)` bug in `hasFsharpCode` (grammars.ts).
 - C# class deriving from F# class: inherited bare calls.
 - Sync cost: file-node scan per sync (`fsharpConfigFiles`), `.fsi` entries never removed, shader `.fs` re-read every sync, `.fsi` reopen batching.
 - Detector: C-comment-only / GLSL-statement-only `.fs` read as F#.
