@@ -289,11 +289,10 @@ const FSHARP_DECLARATION_RE = new RegExp(
 );
 
 /**
- * Other F# lines — a `let` binding, a type definition, an attribute, a script
- * directive — for the one file of a project that may skip the declaration
- * (`Program.fs`). They count only when no GLSL line is there. Forth starts no
- * line this way either: its `type` is a word that prints a string, never
- * followed by a name and `=`.
+ * Other F# lines: a `let` binding, a type definition, an attribute, a script
+ * directive. Neither GLSL nor Forth starts a line this way — Forth's `type` is a
+ * word that prints a string, never followed by a name and `=` — so one is F#
+ * even beside a GLSL-looking line, which then sits in a string.
  */
 const FSHARP_SIGNALS: readonly RegExp[] = [
   /^[ \t\uFEFF]*let(?:[ \t]+(?:rec|inline|mutable|private|internal|public))*[ \t]+[\w'`(][^=\n]*=/m,
@@ -311,23 +310,57 @@ const GLSL_SIGNAL_RE = new RegExp(
     String.raw`#[ \t]*(?:version|extension|define|undef|ifdef|ifndef|pragma|include)\b` +
     String.raw`|precision[ \t]+(?:lowp|mediump|highp)\b` +
     String.raw`|(?:uniform|varying|attribute)[ \t]+\w+[ \t]+\w` +
-    String.raw`|layout[ \t]*\(` +
-    String.raw`|(?:in|out)[ \t]+(?:[biu]?vec[234]|float|int|mat[234])\b` +
+    String.raw`|layout[ \t]*\([ \t]*(?:location|binding|set|std140|std430|local_size_[xyz])\b` +
+    String.raw`|(?:in|out|inout)[ \t]+(?:(?:highp|mediump|lowp|flat|smooth)[ \t]+)*(?:[biud]?vec[234]|float|int|uint|bool|mat[234](?:x[234])?|sampler\w*)[ \t]+\w+[ \t]*;` +
     String.raw`|void[ \t]+main[ \t]*\(` +
   ')',
   'm'
 );
 
 /**
+ * Forth's lines, which F# never writes: a `\\ ` comment at the start of a line
+ * (F# starts no line with a backslash); a colon definition closed by ` ;` on its
+ * line (`: square dup * ;`); a stack comment (`( n -- f )`); loading another
+ * Forth file (`require ./lib.fs`); a base switch alone on its line (`hex`); and
+ * two numbers before a word (`20 1 oprrnnn rlwimi.`), where F# would need a
+ * comma or a semicolon between them.
+ */
+const FORTH_SIGNAL_RE = new RegExp(
+  String.raw`^[ \t\uFEFF]*(?:` +
+    String.raw`\\(?:[ \t]|$)` +
+    String.raw`|:[ \t]+\S+[ \t].*[ \t];[ \t]*(?:\\.*)?$` +
+    String.raw`|(?:require|include|needs)[ \t]+\S+\.fs[ \t]*$` +
+    String.raw`|(?:hex|decimal|octal)[ \t]*$` +
+    String.raw`|[-$]?\d\w*[ \t]+[-$]?\d\w*[ \t]+[A-Za-z~]` +
+  String.raw`)|\([ \t](?:[^()\n]*[ \t])?--(?:[ \t][^()\n]*)?\)`,
+  'm'
+);
+
+/** A Forth colon definition over several lines: `: name` opening a line, and a line closed by `;`. */
+const FORTH_COLON_OPEN_RE = /^[ \t]*:[ \t]+\S+/m;
+const FORTH_COLON_CLOSE_RE = /[ \t];[ \t]*(?:immediate[ \t]*)?$/m;
+
+function looksLikeForth(head: string): boolean {
+  return FORTH_SIGNAL_RE.test(head) || (FORTH_COLON_OPEN_RE.test(head) && FORTH_COLON_CLOSE_RE.test(head));
+}
+
+/**
  * Whether the head of a `.fs` file is F#, not a GLSL fragment shader or Forth.
- * A file that reads as neither — no declaration and no other F# line — is not
- * F#: an F# file with nothing in it to index loses nothing by being skipped,
- * while a shader parsed with the F# grammar is nothing but an error tree.
+ * An F# line decides for F#; else a GLSL or a Forth line decides against it;
+ * else it is F# — the last file of a program may hold nothing but expressions,
+ * like the `Program.fs` of `dotnet new console -lang F#` (`printfn "Hello from F#"`).
+ * A file with no code in it is not: there is nothing to index, and it would
+ * load the grammar for nothing.
  */
 export function looksLikeFsharp(head: string): boolean {
-  if (FSHARP_DECLARATION_RE.test(head)) return true;
-  if (GLSL_SIGNAL_RE.test(head)) return false;
-  return FSHARP_SIGNALS.some((re) => re.test(head));
+  if (FSHARP_DECLARATION_RE.test(head) || FSHARP_SIGNALS.some((re) => re.test(head))) return true;
+  if (GLSL_SIGNAL_RE.test(head) || looksLikeForth(head)) return false;
+  return hasFsharpCode(head);
+}
+
+/** Whether F# source has anything but comments and blank lines. */
+function hasFsharpCode(source: string): boolean {
+  return source.replace(/\(\*[\s\S]*?\*\)|\/\/[^\n]*/g, '').trim() !== '';
 }
 
 /** Decodes a head that may end mid-character: the cut character becomes U+FFFD, which no rule reads. */

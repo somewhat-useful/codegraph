@@ -115,6 +115,20 @@ describe('looksLikeFsharp', () => {
     expect(looksLikeFsharp(FSHARP_WITH_SHADER_STRING)).toBe(true);
   });
 
+  it('reads a last file of nothing but expressions as F#, like the console template\'s Program.fs', () => {
+    expect(looksLikeFsharp('// For more information see https://aka.ms/fsharp-console-apps\nprintfn "Hello from F#"\n')).toBe(true);
+    expect(looksLikeFsharp('main ()\n')).toBe(true);
+    expect(looksLikeFsharp('f1 2 x\n')).toBe(true);
+  });
+
+  it('reads Forth without comments or one-line definitions as not F#', () => {
+    // gforth's arch/6502/zero.fs, wordlibs/unixlib.fs and arch/power/nofsfcopyright/ops.fs.
+    expect(looksLikeFsharp('\nhex\n\n$30\ndup constant wpshd 1 +\ndrop\n')).toBe(false);
+    expect(looksLikeFsharp('\nrequire ./../wordlib.fs\n\n: cconst"\n  \'" word count\n  THEN ; immediate\n')).toBe(false);
+    expect(looksLikeFsharp('20 1 oprrnnn rlwimi.\n63 711 ~RC opifr mtfsf\n')).toBe(false);
+    expect(looksLikeFsharp('variable n ( -- addr )\n')).toBe(false);
+  });
+
   it('reads an empty or comment-only file as not F#', () => {
     expect(looksLikeFsharp('')).toBe(false);
     expect(looksLikeFsharp('// nothing here\n')).toBe(false);

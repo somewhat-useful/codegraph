@@ -83,22 +83,31 @@ grammar preload reads `.fs` heads only up to the first F# file, so a shader or
 Forth repository never loads the 11.4 MB grammar. `.fsx` (F# script) has no
 such clash and is always F#.
 
-A `.fs` file is F# when it has:
+A `.fs` file is F# unless it says otherwise:
 
-1. a `namespace` or `module` declaration, or an `open` of a namespace, on a
-   line of its own — every F# file of a project but the last must begin with a
-   namespace or module declaration (FS0222); or, failing that,
-2. no GLSL line (`#version`, `#define`, `#ifdef`, `precision mediump float`,
-   `uniform` / `varying` / `attribute` declarations, `layout(`, `in` / `out`
-   `vec4 …`, `void main(`) **and** an F# line: a `let` binding, a `type`
-   definition, a `[<Attribute>]`, or a script directive like `#r "…"`.
+1. a line only F# writes decides for F#: a `namespace` or `module`
+   declaration, an `open` of a namespace, a `let` binding, a `type` definition,
+   a `[<Attribute>]`, or a script directive like `#r "…"`. A GLSL line beside one
+   is a shader kept in an F# string;
+2. otherwise a GLSL line decides against it: `#version`, `#define`, `#ifdef`,
+   `precision mediump float`, `uniform` / `varying` / `attribute` declarations,
+   `layout(location = …)`, `in` / `out` declarations like `in vec2 uv;`,
+   `void main(`;
+3. otherwise a Forth line does: a `\ ` comment at the start of a line, a colon
+   definition (`: square dup * ;`, or `: name` with a later line closed by `;`),
+   a stack comment (`( n -- f )`), `require x.fs`, a base switch alone on its
+   line (`hex`), or two numbers before a word (`20 1 oprrnnn`), where F# needs a
+   comma or a semicolon;
+4. otherwise it is F#: the last file of a program may hold nothing but
+   expressions, like the `Program.fs` of `dotnet new console -lang F#`
+   (`printfn "Hello from F#"`). A file of nothing but comments is not indexed:
+   there is nothing in it.
 
-Neither GLSL nor Forth writes a line of the first kind, and Forth's `type` is a
-word that prints, never followed by a name and `=`. A GLSL line beside a
-declaration is a shader kept in an F# string, so the declaration wins.
+Forth's `type` is a word that prints a string, never followed by a name and
+`=`, and neither GLSL nor Forth writes a line of the first kind.
 
-Measured: all 166 `.fs` files of FSharp.Data and Giraffe read as F#; none of
-LearnOpenGL's 158 shaders or gforth's 546 Forth files do.
+Measured: all 432 `.fs` files with code in FSharp.Data, Giraffe and Paket read
+as F#; none of LearnOpenGL's 158 shaders or gforth's 546 Forth files do.
 
 The answer depends only on the file's own bytes, so a full index, a sync of one
 edited file and a fresh re-index agree. A project can always decide for itself
