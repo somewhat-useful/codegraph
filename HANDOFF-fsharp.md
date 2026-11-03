@@ -15,11 +15,12 @@ Branch `fsharp-support-wip` (work in progress). `fsharp-support` = last pushed r
 
 5. **Done:** C# → F#: a bare name, `this.M` and `base.M` find members (static or not) and nested types of the enclosing C# type and of what it inherits — an F# base class included — before any namespace (`dotnetRank`, used for F# targets and C# namesakes alike); the C# → F# step now runs before generic `methodCall`, since it applies C#'s whole lookup across both languages. Tests: `fsharp-scope.test.ts` "C# deriving from an F# class"; C# suites pass.
 
+6. **Done:** detector — a C block comment (`/*`, F# starts no line with `/`) and GLSL vector/matrix constructors (`vec4(`, `mat3(`) are GLSL signals (`grammars.ts`, doc updated, tests in `fsharp-detection.test.ts`).
+
 ## Not verified yet
 - Timing after the cached-bindings rewrite (before it: Paket 6.7s → 10s; the rewrite targets the remaining extractor cost). Run: `npm run build`, then index FSharp.Data / Giraffe / Paket.
 - Full `npm test` after this step (only `glyphs.test.ts` fails, also on upstream).
 
 ## Remaining (from last review)
 - Sync cost: file-node scan per sync (`fsharpConfigFiles`), `.fsi` entries never removed, shader `.fs` re-read every sync, `.fsi` reopen batching.
-- Detector: C-comment-only / GLSL-statement-only `.fs` read as F#.
 - Then one full review. Rule from the user: fix only as general cases, never special cases.

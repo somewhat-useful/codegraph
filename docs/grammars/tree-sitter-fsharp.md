@@ -94,7 +94,9 @@ A `.fs` file is F# unless it says otherwise:
    `layout(location = …)`, `in` / `out` declarations like `in vec2 uv;`,
    `void main(`, or a C-style function or variable that names its type first
    (`vec3 shade(vec3 n, vec3 l) {`, `const float k = 0.5;`) — an include of
-   helper functions has nothing else;
+   helper functions has nothing else — a C block comment (`/* … */`: F#
+   starts no line with `/`), or a vector or matrix constructor (`vec4(1.0)`,
+   `mat3(…)`), which F# does not have;
 3. otherwise a Forth line does: a `\ ` comment at the start of a line, a colon
    definition (`: square dup * ;`, or `: name` with a later line closed by `;`),
    a stack comment (`( n -- f )`), `require x.fs`, a base switch alone on its

@@ -93,6 +93,10 @@ describe('looksLikeFsharp', () => {
   it('reads a GLSL include of helper functions, with no preprocessor line or `main`, as not F#', () => {
     expect(looksLikeFsharp('// lighting helpers\nvec3 shade(vec3 n, vec3 l) {\n    return max(dot(n, l), 0.0) * vec3(1.0);\n}\n')).toBe(false);
     expect(looksLikeFsharp('const float PI = 3.14159;\nfloat sq(float x) { return x * x; }\n')).toBe(false);
+    // A C block comment, and GLSL's vector and matrix constructors, which F# has neither of.
+    expect(looksLikeFsharp('// fragment shader\n/* nothing */\n')).toBe(false);
+    expect(looksLikeFsharp('FRAGCOLOR = vec4(1.0);\n')).toBe(false);
+    expect(looksLikeFsharp('gl_Position = proj * mat4(1.0) * pos;\n')).toBe(false);
     // An F# line still wins: a shader kept in a string.
     expect(looksLikeFsharp('let shader = """\nvec3 shade(vec3 n) { return n; }\n"""\n')).toBe(true);
   });

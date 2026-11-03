@@ -318,7 +318,11 @@ const GLSL_SIGNAL_RE = new RegExp(
     // A C-style typed function or variable: `vec3 shade(vec3 n) {`, `const float k = 0.5;` — an
     // include of helpers has nothing else. F# writes no type before a name.
     String.raw`|(?:(?:const|highp|mediump|lowp)[ \t]+)*(?:void|float|double|u?int|bool|[biud]?vec[234]|d?mat[234](?:x[234])?|sampler\w+)[ \t]+[A-Za-z_]\w*[ \t]*(?:\(|=[^=]|;|\[)` +
-  ')',
+    // A C block comment: F# starts no line with `/`, which as division needs a left operand.
+    String.raw`|\/\*` +
+  ')' +
+  // GLSL's vector and matrix constructors, which F# does not have: `FragColor = vec4(1.0);`.
+  String.raw`|\b[biud]?vec[234][ \t]*\(|\bd?mat[234](?:x[234])?[ \t]*\(`,
   'm'
 );
 
