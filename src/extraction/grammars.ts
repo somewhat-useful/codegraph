@@ -143,11 +143,12 @@ export const EXTENSION_MAP: Record<string, Language> = {
   '.cu': 'cpp',
   '.cuh': 'cpp',
   '.nix': 'nix',
-  // F# scripts. An F# implementation file's `.fs` is also what GLSL fragment
-  // shaders and Forth are written in, so it is not in this map: it is F# only
-  // when its content says so (see `isFsharpFile` / `looksLikeFsharp`). `.fsi`
-  // signature files are left out: the grammar mis-parses their `val`
-  // declarations and every symbol they hold is declared in the `.fs` anyway.
+  // F#: .fs (implementation) and .fsx (script). GLSL fragment shaders and
+  // Forth use `.fs` too, so a `.fs` file whose head is not F# is skipped when
+  // it is read (`isForeignToExtension`). `.fsi` signature files are left out:
+  // the grammar mis-parses their `val` declarations and every symbol they hold
+  // is declared in the `.fs` anyway.
+  '.fs': 'fsharp',
   '.fsx': 'fsharp',
   // XML: file-level tracking; the MyBatis extractor matches `<mapper namespace="...">`
   // shape and emits SQL-statement nodes (other XML returns empty).
@@ -252,8 +253,7 @@ export function hasMpegTsExtension(filePath: string): boolean {
  *
  * `rootDir` is the project root `filePath` is relative to. A Shopify theme's
  * JSON templates count only when it is given, since telling a theme apart takes
- * a look at the files beside them (see `isShopifyLiquidJson`). An `.fs` file
- * counts only when its content is F# (see `isFsharpFile`), read from there.
+ * a look at the files beside them (see `isShopifyLiquidJson`).
  */
 export function isSourceFile(filePath: string, overrides?: Record<string, Language>, rootDir?: string): boolean {
   if (isPlayRoutesFile(filePath)) return true; // Play `conf/routes` is extensionless
@@ -262,88 +262,92 @@ export function isSourceFile(filePath: string, overrides?: Record<string, Langua
   const dot = filePath.lastIndexOf('.');
   if (dot < 0) return false;
   const ext = filePath.slice(dot).toLowerCase();
-  if (ext in EXTENSION_MAP || (!!overrides && ext in overrides)) return true;
-  return ext === FSHARP_SHARED_EXT && isFsharpFile(filePath, rootDir) !== false;
+  return ext in EXTENSION_MAP || (!!overrides && ext in overrides);
 }
 
+/** Whether `filePath` carries `.fs`, which F# shares with GLSL fragment shaders (`shader.fs` beside `shader.vs`) and Forth. */
+export function hasFsExtension(filePath: string): boolean {
+  return filePath.length > 3 && filePath.slice(-3).toLowerCase() === '.fs';
+}
+
+/** How much of a `.fs` file's head `looksLikeFsharp` reads: an F# file's declarations come first. */
+export const FSHARP_SNIFF_BYTES = 32 * 1024;
+
 /**
- * The extension F# implementation files share with GLSL fragment shaders
- * (`shader.fs` beside `shader.vs`) and Forth. Deliberately not in
- * EXTENSION_MAP: a `.fs` file is F# only when `looksLikeFsharp` says so, so a
- * shader or Forth repository neither loads the F# grammar nor gets its files
- * parsed into error trees. A codegraph.json mapping for `.fs` is the user's
- * answer and is not second-guessed.
+ * A line no GLSL shader or Forth source has: a `namespace` or `module`
+ * declaration — every F# file of a project but the last must open with one
+ * (FS0222) — or an `open` of a namespace. Enough on its own, even beside a
+ * GLSL-looking line, which in F# is a shader kept in a string
+ * (`"""#version 330 …"""`).
  */
-const FSHARP_SHARED_EXT = '.fs';
-
-/** How much of an `.fs` file is read to tell F# apart: its declarations come first. */
-const FSHARP_SNIFF_BYTES = 32 * 1024;
-
-/**
- * F# lines no GLSL shader or Forth source has: a `namespace` or `module`
- * declaration, which every F# file but a project's last one must open with, or
- * an `open` of a namespace. Enough on their own, even beside a GLSL-looking
- * line, which in F# is a shader kept in a string (`"""#version 330 …"""`).
- */
-const FSHARP_DECLARATION_RE =
-  /^[ \t\uFEFF]*(?:(?:namespace|module)(?:[ \t]+(?:rec|private|internal|public))?[ \t]+[A-Za-z_`][\w.`']*[ \t]*(?:=[ \t]*)?(?:\/\/.*)?\r?$|open[ \t]+(?:type[ \t]+)?[A-Z][\w.`]*[ \t]*(?:\/\/.*)?\r?$)/m;
+const FSHARP_DECLARATION_RE = new RegExp(
+  String.raw`^[ \t\uFEFF]*(?:` +
+    String.raw`(?:namespace|module)(?:[ \t]+(?:rec|private|internal|public))*[ \t]+[A-Za-z_\x60][\w.\x60']*[ \t]*(?:=[ \t]*)?` +
+    String.raw`|open[ \t]+(?:type[ \t]+)?[A-Z][\w.\x60]*[ \t]*` +
+  String.raw`)(?:\/\/.*)?\r?$`,
+  'm'
+);
 
 /**
- * Other F# line shapes — a `let` binding, a type definition, an attribute, a
- * script directive — for the one file of a project that may skip the
- * declaration (`Program.fs`). Counted only when no GLSL line is there. Neither
- * GLSL nor Forth starts a line this way: Forth's `type` is a word that prints
- * a string, never followed by a name and `=`.
+ * Other F# lines — a `let` binding, a type definition, an attribute, a script
+ * directive — for the one file of a project that may skip the declaration
+ * (`Program.fs`). They count only when no GLSL line is there. Forth starts no
+ * line this way either: its `type` is a word that prints a string, never
+ * followed by a name and `=`.
  */
 const FSHARP_SIGNALS: readonly RegExp[] = [
-  /^[ \t]*let(?:[ \t]+(?:rec|inline|mutable|private|internal|public))*[ \t]+[\w'`(][^=\n]*=/m,
-  /^[ \t]*type[ \t]+(?:(?:private|internal|public)[ \t]+)?[A-Za-z_`][\w'`]*(?:[ \t]*<[^>\n]*>)?(?:[ \t]*\([^)\n]*\))?[ \t]*(?:=|with\b)/m,
-  /^[ \t]*\[<[A-Za-z][\w.]*(?:\(|>\]|[ \t]*;|[ \t]*>)/m,
-  /^[ \t]*#(?:r|load|nowarn|light|I)[ \t]+"/m,
+  /^[ \t\uFEFF]*let(?:[ \t]+(?:rec|inline|mutable|private|internal|public))*[ \t]+[\w'`(][^=\n]*=/m,
+  /^[ \t\uFEFF]*type[ \t]+(?:(?:private|internal|public)[ \t]+)?[A-Za-z_`][\w'`]*(?:[ \t]*<[^>\n]*>)?(?:[ \t]*\([^)\n]*\))?[ \t]*(?:=|with\b)/m,
+  /^[ \t\uFEFF]*\[<[A-Za-z][\w.]*(?:\(|>\]|[ \t]*;|[ \t]*>)/m,
+  /^[ \t\uFEFF]*#(?:r|load|nowarn|light|I)[ \t]+"/m,
 ];
 
 /**
- * GLSL's preprocessor and declarations: lines F# never writes outside a
- * string. (F# has `#if` / `#else` / `#endif` but no `#define`, `#version`.)
+ * GLSL's preprocessor lines and declarations, which F# never writes outside a
+ * string: F# has `#if` / `#else` / `#endif`, but no `#version` or `#define`.
  */
-const GLSL_SIGNAL_RE =
-  /^[ \t]*(?:#[ \t]*(?:version|extension|define|undef|ifdef|ifndef|pragma|include)\b|precision[ \t]+(?:lowp|mediump|highp)\b|(?:uniform|varying|attribute)[ \t]+\w+[ \t]+\w|(?:layout[ \t]*\(|(?:in|out)[ \t]+(?:[biu]?vec[234]|float|int|mat[234])\b)|void[ \t]+main[ \t]*\()/m;
+const GLSL_SIGNAL_RE = new RegExp(
+  String.raw`^[ \t\uFEFF]*(?:` +
+    String.raw`#[ \t]*(?:version|extension|define|undef|ifdef|ifndef|pragma|include)\b` +
+    String.raw`|precision[ \t]+(?:lowp|mediump|highp)\b` +
+    String.raw`|(?:uniform|varying|attribute)[ \t]+\w+[ \t]+\w` +
+    String.raw`|layout[ \t]*\(` +
+    String.raw`|(?:in|out)[ \t]+(?:[biu]?vec[234]|float|int|mat[234])\b` +
+    String.raw`|void[ \t]+main[ \t]*\(` +
+  ')',
+  'm'
+);
 
 /**
- * Whether the source of an `.fs` file is F#, not a GLSL fragment shader or
- * Forth. Decided by the file's own bytes only, so a full index, a sync of the
- * one edited file and a fresh re-index always agree. A file with neither
- * reading — no declaration and no other F# line — is not F#: leaving out an
- * F# file that holds nothing to index loses nothing, and parsing a shader
- * with the F# grammar yields only an error tree.
+ * Whether the head of a `.fs` file is F#, not a GLSL fragment shader or Forth.
+ * A file that reads as neither — no declaration and no other F# line — is not
+ * F#: an F# file with nothing in it to index loses nothing by being skipped,
+ * while a shader parsed with the F# grammar is nothing but an error tree.
  */
-export function looksLikeFsharp(source: string): boolean {
-  const head = source.length > FSHARP_SNIFF_BYTES ? source.slice(0, FSHARP_SNIFF_BYTES) : source;
+export function looksLikeFsharp(head: string): boolean {
   if (FSHARP_DECLARATION_RE.test(head)) return true;
   if (GLSL_SIGNAL_RE.test(head)) return false;
   return FSHARP_SIGNALS.some((re) => re.test(head));
 }
 
+/** Decodes a head that may end mid-character: the cut character becomes U+FFFD, which no rule reads. */
+const UTF8 = new TextDecoder('utf-8');
+
 /**
- * Whether the `.fs` file at `filePath` (relative to `rootDir`, or as given) is
- * F#, from the head of its content; undefined when it can't be read — a file
- * that was just deleted, which a sync must still see to drop it.
+ * Whether the bytes read from `filePath` are not the language its extension
+ * names, so the file is not source after all: a `.ts` that is an MPEG
+ * transport stream (#1910), or a `.fs` that is a GLSL shader or Forth.
+ * Decided from bytes the caller has already read and from those alone, so a
+ * full index, a sync of the one edited file and a fresh re-index agree, and a
+ * tracked file that turns into one is dropped. A codegraph.json mapping for
+ * `.fs` is the project's answer and is not second-guessed.
  */
-export function isFsharpFile(filePath: string, rootDir?: string): boolean | undefined {
-  const full = rootDir === undefined ? filePath : path.resolve(rootDir, filePath);
-  let fd: number | undefined;
-  try {
-    fd = fs.openSync(full, 'r');
-    const buf = Buffer.alloc(FSHARP_SNIFF_BYTES);
-    const n = fs.readSync(fd, buf, 0, FSHARP_SNIFF_BYTES, 0);
-    return looksLikeFsharp(buf.toString('utf8', 0, n));
-  } catch {
-    return undefined;
-  } finally {
-    if (fd !== undefined) {
-      try { fs.closeSync(fd); } catch { /* already closed */ }
-    }
+export function isForeignToExtension(filePath: string, bytes: Uint8Array, overrides?: Record<string, Language>): 'mpeg-ts' | 'not-fsharp' | null {
+  if (hasMpegTsExtension(filePath) && isMpegTransportStream(bytes.subarray(0, MPEG_TS_SNIFF_BYTES))) return 'mpeg-ts';
+  if (hasFsExtension(filePath) && !overrides?.['.fs'] && !looksLikeFsharp(UTF8.decode(bytes.subarray(0, FSHARP_SNIFF_BYTES)))) {
+    return 'not-fsharp';
   }
+  return null;
 }
 
 /**
@@ -703,13 +707,6 @@ export function detectLanguage(filePath: string, source?: string, overrides?: Re
   // top-level expressions (last-dot ext `.src` is too generic for the map).
   if (isErlangAppFile(filePath)) return 'erlang';
   const lang = (overrides && overrides[ext]) || EXTENSION_MAP[ext] || 'unknown';
-
-  // `.fs` is F#, a GLSL fragment shader or Forth: F# only by its content,
-  // read from the file when the caller has no source (the grammar preload).
-  if (lang === 'unknown' && ext === FSHARP_SHARED_EXT) {
-    if (source !== undefined) return looksLikeFsharp(source) ? 'fsharp' : 'unknown';
-    return isFsharpFile(filePath, rootDir) === false ? 'unknown' : 'fsharp';
-  }
 
   // A Flow-typed `.js` (`// @flow` in its leading comments) parses as TSX:
   // the JavaScript grammar can't read its annotations — `render(): React.Node`

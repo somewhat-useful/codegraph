@@ -139,14 +139,6 @@ function joinPath(prefix: string, rest: string): string {
   return prefix === '' ? rest : `${prefix}.${rest}`;
 }
 
-/** Does `opened` reach `path`, with at most one more segment? (A type or module directly under it.) */
-function openReaches(path: string, opened: string): boolean {
-  const at = `.${path}.`.indexOf(`.${opened}.`);
-  if (at < 0) return false;
-  const rest = `.${path}.`.slice(at + opened.length + 2);
-  return rest.split('.').filter((seg) => seg !== '').length <= 1;
-}
-
 /** A qualifier names a module or type when it starts with a capital or a backtick; a lowercase one is a value. */
 function namesContainer(qualifier: string): boolean {
   return /^(?:``|\p{Lu})/u.test(qualifier);
@@ -197,7 +189,9 @@ export function isFsharpCandidateReachable(ref: FsharpRefScope, candidate: Fshar
     if (UNIVERSAL_MEMBERS.has(candidate.name)) return false;
     if (ref.namespace !== '' && ref.namespace === candidate.namespace) return true;
     if (ref.container !== '' && (isPathPrefix(c, ref.container) || isPathPrefix(ref.container, c))) return true;
-    return [...opens].some((o) => openReaches(c, o));
+    // An open reaches its own members and those of a type or module directly under it. The
+    // opens are full paths (joined to the scopes around the reference), so `open Core` is never `Vendor.Core`.
+    return opens.has(c) || opens.has(parentPath(c));
   }
 
   if (ref.qualifiers.length > 0) return false;

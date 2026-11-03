@@ -56,6 +56,17 @@ describe('isFsharpCandidateReachable', () => {
     expect(isFsharpCandidateReachable(ref({ opens: ['Other.Lib'] }), candidate('Other.Lib.Fn'))).toBe(false);
   });
 
+  it('reaches a member through a value from what an open names as a prefix, never from the middle of a path', () => {
+    const save = (container: string): FsharpCandidateScope => candidate(container, { name: 'Save', kind: 'method', namespace: 'Vendor.Core' });
+    const viaValue = ref({ container: 'App.Main', namespace: 'App', opens: ['Core'], qualifiers: ['repo'] });
+    // `open Core` in `App.Main` names `Core` or `App.Core`: never `Vendor.Core`.
+    expect(isFsharpCandidateReachable(viaValue, save('Vendor.Core.Repo'))).toBe(false);
+    expect(isFsharpCandidateReachable(viaValue, save('App.Core.Repo'))).toBe(true);
+    expect(isFsharpCandidateReachable(viaValue, save('Core.Repo'))).toBe(true);
+    // A type directly under the opened scope, not one further down.
+    expect(isFsharpCandidateReachable(viaValue, save('Core.Data.Repo'))).toBe(false);
+  });
+
   it('reads an open relative to the scope it is written in', () => {
     expect(isFsharpCandidateReachable(ref({ container: 'Shop.App', opens: ['Lib'] }), candidate('Shop.Lib'))).toBe(true);
     expect(isFsharpCandidateReachable(ref({ container: 'Shop.App', opens: ['Library'] }), candidate('Shop.Lib'))).toBe(false);

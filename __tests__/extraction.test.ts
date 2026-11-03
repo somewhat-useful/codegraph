@@ -223,11 +223,11 @@ describe('Language Detection', () => {
   });
 
   it('should detect F# implementation and script files, not signature files', () => {
-    // `.fs` is F# by content (GLSL shaders and Forth share it): see fsharp-detection.test.ts.
-    expect(detectLanguage('src/Program.fs', 'module App.Program\n\nlet main () = 0\n')).toBe('fsharp');
+    // A `.fs` GLSL shader or Forth file is skipped when read: see fsharp-detection.test.ts.
+    expect(detectLanguage('src/Program.fs')).toBe('fsharp');
     expect(detectLanguage('src/Library.fsi')).not.toBe('fsharp');
     expect(detectLanguage('build.fsx')).toBe('fsharp');
-    expect(isSourceFile('build.fsx')).toBe(true);
+    expect(isSourceFile('src/Program.fs')).toBe(true);
   });
 
   it('should detect a .h whose only C++ signal is an export-macro class as cpp', () => {

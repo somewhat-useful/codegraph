@@ -34,7 +34,7 @@ at install time; the file has to live in the repository like the other vendored
 grammars.
 
 The file is large (11.4 MB) because the F# parser tables are. It is loaded only
-for a project that has F# in it: `.fsx` files, or `.fs` files whose content is
+for a project that has F# in it: a `.fsx` file, or a `.fs` file whose head is
 F# (see "Telling F# from GLSL and Forth" below).
 
 The tag also has a `fsharp_signature` grammar (2.7 MB) for `.fsi` signature
@@ -73,11 +73,15 @@ run the F# suites: `npx vitest run __tests__/extraction.test.ts -t "F#"`,
 ## Telling F# from GLSL and Forth
 
 `.fs` is also the usual extension for GLSL fragment shaders (`shader.vs` /
-`shader.fs`) and for Forth. So `.fs` is not in the extension table: a `.fs`
-file is indexed as F# only when the first 32 KB of its content read as F#, and
-is otherwise skipped as it was before F# support — the F# grammar is never
-loaded for it and it is never parsed. `.fsx` (F# script) has no such clash and
-is always F#.
+`shader.fs`) and for Forth. A `.fs` file is still discovered by its extension,
+like any other, but where its bytes are read for indexing, the first 32 KB are
+checked (`isForeignToExtension`, the same gate that skips an MPEG transport
+stream named `.ts`, #1910): a file that does not read as F# is skipped —
+counted as skipped, never stored, never parsed — and an indexed F# file that
+turns into one is dropped on the next sync. Discovery opens no file. The
+grammar preload reads `.fs` heads only up to the first F# file, so a shader or
+Forth repository never loads the 11.4 MB grammar. `.fsx` (F# script) has no
+such clash and is always F#.
 
 A `.fs` file is F# when it has:
 
@@ -92,6 +96,9 @@ A `.fs` file is F# when it has:
 Neither GLSL nor Forth writes a line of the first kind, and Forth's `type` is a
 word that prints, never followed by a name and `=`. A GLSL line beside a
 declaration is a shader kept in an F# string, so the declaration wins.
+
+Measured: all 166 `.fs` files of FSharp.Data and Giraffe read as F#; none of
+LearnOpenGL's 158 shaders or gforth's 546 Forth files do.
 
 The answer depends only on the file's own bytes, so a full index, a sync of one
 edited file and a fresh re-index agree. A project can always decide for itself

@@ -1,14 +1,17 @@
 /**
  * `.fs` is F#, but also the usual extension of GLSL fragment shaders and of
- * Forth. A `.fs` file is F# only by its content: a shader or Forth repository
- * must neither load the F# grammar nor have its files parsed into error trees.
+ * Forth. A `.fs` file whose head is not F# is skipped where its bytes are read,
+ * like an MPEG transport stream named `.ts` (#1910): a shader or Forth
+ * repository neither loads the F# grammar nor gets its files parsed into error
+ * trees, and an F# file that turns into one is dropped.
  */
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, afterEach } from 'vitest';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
-import { detectLanguage, isSourceFile, looksLikeFsharp } from '../src/extraction/grammars';
-import { preloadLanguagesForFiles, scanDirectory } from '../src/extraction';
+import { CodeGraph } from '../src';
+import { detectLanguage, isForeignToExtension, isSourceFile, looksLikeFsharp } from '../src/extraction/grammars';
+import { preloadLanguagesForFiles } from '../src/extraction';
 
 const GLSL_FRAGMENT = `#version 330 core
 out vec4 FragColor;
@@ -92,10 +95,16 @@ describe('looksLikeFsharp', () => {
     expect(looksLikeFsharp(FSHARP_NAMESPACE)).toBe(true);
     expect(looksLikeFsharp(FSHARP_PROGRAM)).toBe(true);
     expect(looksLikeFsharp('module rec Parser\n')).toBe(true);
+    expect(looksLikeFsharp('module internal rec Parser\n')).toBe(true);
     expect(looksLikeFsharp('namespace global\n')).toBe(true);
     expect(looksLikeFsharp('﻿namespace Foo.Bar\r\n\r\nopen System // io\r\n')).toBe(true);
     expect(looksLikeFsharp('#r "nuget: FSharp.Data"\n')).toBe(true);
     expect(looksLikeFsharp('type Shape =\n  | Circle of float\n')).toBe(true);
+  });
+
+  it('reads a BOM-led Program.fs whose only F# line is its first', () => {
+    expect(looksLikeFsharp('﻿let main _ = 0\n')).toBe(true);
+    expect(looksLikeFsharp('﻿[<EntryPoint>]\nmain\n')).toBe(true);
   });
 
   it('keeps an F# file that holds a shader in a string F#', () => {
@@ -108,79 +117,109 @@ describe('looksLikeFsharp', () => {
   });
 });
 
-describe('.fs detection', () => {
-  let dir: string;
+describe('isForeignToExtension', () => {
+  const bytes = (text: string): Buffer => Buffer.from(text, 'utf8');
 
-  beforeEach(() => {
-    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-fs-detect-'));
+  it('names a .fs shader or Forth file not F#, and an F# one nothing', () => {
+    expect(isForeignToExtension('shaders/basic.fs', bytes(GLSL_FRAGMENT))).toBe('not-fsharp');
+    expect(isForeignToExtension('lib/sieve.FS', bytes(FORTH))).toBe('not-fsharp');
+    expect(isForeignToExtension('src/Pricing.fs', bytes(FSHARP_MODULE))).toBeNull();
   });
 
-  afterEach(() => {
-    fs.rmSync(dir, { recursive: true, force: true });
+  it('leaves other extensions alone, .fsx included', () => {
+    expect(isForeignToExtension('build.fsx', bytes(GLSL_FRAGMENT))).toBeNull();
+    expect(isForeignToExtension('notes.txt', bytes(GLSL_FRAGMENT))).toBeNull();
   });
 
-  const write = (rel: string, content: string): void => {
-    fs.mkdirSync(path.dirname(path.join(dir, rel)), { recursive: true });
-    fs.writeFileSync(path.join(dir, rel), content);
-  };
-
-  it('detects a .fs file by its source', () => {
-    expect(detectLanguage('src/Pricing.fs', FSHARP_MODULE)).toBe('fsharp');
-    expect(detectLanguage('shaders/basic.fs', GLSL_FRAGMENT)).toBe('unknown');
-    expect(detectLanguage('lib/sieve.fs', FORTH)).toBe('unknown');
+  it('takes a codegraph.json mapping for .fs as the answer', () => {
+    expect(isForeignToExtension('shaders/basic.fs', bytes(GLSL_FRAGMENT), { '.fs': 'fsharp' })).toBeNull();
   });
+});
 
-  it('always detects .fsx as F#, and never .fsi', () => {
+describe('.fs by path', () => {
+  it('is F# by path, as .fsx is, and .fsi is not indexed', () => {
+    expect(detectLanguage('src/Pricing.fs')).toBe('fsharp');
+    expect(isSourceFile('src/Pricing.fs')).toBe(true);
     expect(detectLanguage('build.fsx')).toBe('fsharp');
-    expect(isSourceFile('build.fsx')).toBe(true);
-    expect(detectLanguage('src/Library.fsi')).not.toBe('fsharp');
     expect(isSourceFile('src/Library.fsi')).toBe(false);
   });
+});
 
-  it('counts a .fs file as source only when its content is F#', () => {
-    write('src/Pricing.fs', FSHARP_MODULE);
-    write('shaders/basic.fs', GLSL_FRAGMENT);
-    write('forth/sieve.fs', FORTH);
-    expect(isSourceFile('src/Pricing.fs', undefined, dir)).toBe(true);
-    expect(isSourceFile('shaders/basic.fs', undefined, dir)).toBe(false);
-    expect(isSourceFile('forth/sieve.fs', undefined, dir)).toBe(false);
-    // Path-only detection reads the file from the root.
-    expect(detectLanguage('src/Pricing.fs', undefined, undefined, dir)).toBe('fsharp');
-    expect(detectLanguage('shaders/basic.fs', undefined, undefined, dir)).toBe('unknown');
-  });
+const tempDirs: string[] = [];
+function createProject(files: Record<string, string>): string {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-fs-detect-'));
+  tempDirs.push(dir);
+  for (const [rel, content] of Object.entries(files)) {
+    fs.mkdirSync(path.dirname(path.join(dir, rel)), { recursive: true });
+    fs.writeFileSync(path.join(dir, rel), content);
+  }
+  return dir;
+}
 
-  it('still counts a .fs file that is gone, so a sync can drop it', () => {
-    expect(isSourceFile('src/Deleted.fs', undefined, dir)).toBe(true);
-  });
+afterEach(() => {
+  for (const d of tempDirs.splice(0)) fs.rmSync(d, { recursive: true, force: true });
+});
 
-  it('leaves shaders and Forth out of a scan, and the F# grammar out of a shader repo', () => {
-    write('shaders/basic.vs', '#version 330 core\nvoid main() {}\n');
-    write('shaders/basic.fs', GLSL_FRAGMENT);
-    write('shaders/post.fs', GLSL_ES_FRAGMENT);
-    write('forth/sieve.fs', FORTH);
-    write('src/main.c', 'int main(void) { return 0; }\n');
-
-    const files = scanDirectory(dir);
-    expect(files.filter((f) => f.endsWith('.fs'))).toEqual([]);
+describe('preloading the F# grammar', () => {
+  it('leaves it out for a repository of shaders and Forth', () => {
+    const dir = createProject({
+      'shaders/basic.fs': GLSL_FRAGMENT,
+      'shaders/post.fs': GLSL_ES_FRAGMENT,
+      'forth/sieve.fs': FORTH,
+      'src/main.c': 'int main(void) { return 0; }\n',
+    });
+    const files = ['shaders/basic.fs', 'shaders/post.fs', 'forth/sieve.fs', 'src/main.c'];
     expect(preloadLanguagesForFiles(files, undefined, dir)).not.toContain('fsharp');
-    // Even handed the paths, the preload reads them and does not load F#.
-    expect(preloadLanguagesForFiles(['shaders/basic.fs', 'forth/sieve.fs'], undefined, dir)).not.toContain('fsharp');
   });
 
-  it('scans and preloads F# beside shaders', () => {
-    write('shaders/basic.fs', GLSL_FRAGMENT);
-    write('src/Pricing.fs', FSHARP_MODULE);
-    write('src/Program.fs', FSHARP_PROGRAM);
+  it('loads it when one .fs file is F#, when there is a .fsx, or when codegraph.json maps .fs', () => {
+    const dir = createProject({ 'shaders/basic.fs': GLSL_FRAGMENT, 'src/Pricing.fs': FSHARP_MODULE, 'build.fsx': '' });
+    expect(preloadLanguagesForFiles(['shaders/basic.fs', 'src/Pricing.fs'], undefined, dir)).toContain('fsharp');
+    expect(preloadLanguagesForFiles(['shaders/basic.fs', 'build.fsx'], undefined, dir)).toContain('fsharp');
+    expect(preloadLanguagesForFiles(['shaders/basic.fs'], { '.fs': 'fsharp' }, dir)).toContain('fsharp');
+  });
+});
 
-    const files = scanDirectory(dir).filter((f) => f.endsWith('.fs')).sort();
-    expect(files).toEqual(['src/Pricing.fs', 'src/Program.fs']);
-    expect(preloadLanguagesForFiles(files, undefined, dir)).toContain('fsharp');
+describe('indexing .fs files', () => {
+  it('indexes F# and skips shaders and Forth, counted as skipped, with no errors', async () => {
+    const dir = createProject({
+      'shaders/basic.fs': GLSL_FRAGMENT,
+      'forth/sieve.fs': FORTH,
+      'src/Pricing.fs': FSHARP_MODULE,
+      'src/Program.fs': FSHARP_PROGRAM,
+    });
+    const cg = await CodeGraph.init(dir);
+    try {
+      const result = await cg.indexAll();
+      expect(result.filesSkipped).toBe(2);
+      expect(result.errors.filter((e) => e.filePath?.endsWith('.fs'))).toEqual([]);
+      expect(cg.getFiles().map((f) => f.path).sort()).toEqual(['src/Pricing.fs', 'src/Program.fs']);
+      expect(cg.searchNodes('discount').some((r) => r.node.filePath === 'src/Pricing.fs')).toBe(true);
+
+      // A named sync (the watcher's path) does not let a shader in either.
+      await cg.sync({ paths: ['shaders/basic.fs'] });
+      expect(cg.getFiles().map((f) => f.path).sort()).toEqual(['src/Pricing.fs', 'src/Program.fs']);
+    } finally {
+      await cg.close();
+    }
   });
 
-  it('honours a codegraph.json mapping for .fs as the final answer', () => {
-    write('shaders/basic.fs', GLSL_FRAGMENT);
-    const overrides = { '.fs': 'fsharp' } as const;
-    expect(isSourceFile('shaders/basic.fs', overrides, dir)).toBe(true);
-    expect(detectLanguage('shaders/basic.fs', GLSL_FRAGMENT, overrides, dir)).toBe('fsharp');
+  it('drops an F# file that becomes a shader, and takes it back when it is F# again', async () => {
+    const dir = createProject({ 'src/Pricing.fs': FSHARP_MODULE, 'src/Program.fs': FSHARP_PROGRAM });
+    const cg = await CodeGraph.init(dir, { index: true });
+    try {
+      expect(cg.getFiles().map((f) => f.path)).toContain('src/Pricing.fs');
+
+      fs.writeFileSync(path.join(dir, 'src/Pricing.fs'), GLSL_FRAGMENT);
+      await cg.sync({ paths: ['src/Pricing.fs'] });
+      expect(cg.getFiles().map((f) => f.path)).not.toContain('src/Pricing.fs');
+      expect(cg.searchNodes('discount').filter((r) => r.node.filePath === 'src/Pricing.fs')).toEqual([]);
+
+      fs.writeFileSync(path.join(dir, 'src/Pricing.fs'), FSHARP_MODULE);
+      await cg.sync({ paths: ['src/Pricing.fs'] });
+      expect(cg.searchNodes('discount').some((r) => r.node.filePath === 'src/Pricing.fs')).toBe(true);
+    } finally {
+      await cg.close();
+    }
   });
 });
