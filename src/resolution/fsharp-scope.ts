@@ -544,8 +544,11 @@ function receiversOf(written: string, ref: UnresolvedRef, from: Node | undefined
   const typeName = written.includes('.') ? pathValueType(written, scope, context) : localValueType(written, ref, from, context);
   if (typeName === null) return null;
   const types = typeName.kind === 'path' ? [typeName.path] : reachableTypes(typeName.name, scope, context);
-  if (types.length === 0) return null;
-  const paths = new Set<string>();
+  // `type System.String with member s.Shout() = …` adds members to a type, a project's or not,
+  // where the extension is in scope.
+  const extensions = visibleExtensions(typeName.kind === 'path' ? typeName.path : typeName.name, scope, context);
+  if (types.length === 0 && extensions.length === 0) return null;
+  const paths = new Set<string>(extensions);
   const visit = (node: Node, depth: number): void => {
     const path = node.qualifiedName.split('::').join('.');
     if (paths.has(path) || depth > 8) return;
@@ -573,6 +576,44 @@ function baseTypesOf(path: string, context: ResolutionContext): string[] | null 
   };
   for (const type of types) visit(type, 0);
   return paths.size > 0 ? [...paths] : null;
+}
+
+/** F#'s names for .NET types: an annotation `(s: string)` is a `System.String`. */
+const FSHARP_TYPE_ABBREVIATIONS: Readonly<Record<string, string>> = {
+  string: 'String', int: 'Int32', int32: 'Int32', int64: 'Int64', int16: 'Int16', uint32: 'UInt32', uint64: 'UInt64',
+  float: 'Double', double: 'Double', float32: 'Single', single: 'Single', decimal: 'Decimal', bool: 'Boolean',
+  char: 'Char', byte: 'Byte', sbyte: 'SByte', obj: 'Object', bigint: 'BigInteger', unit: 'Unit',
+};
+
+/** Whether a node is an F# type extension (`type T with …`), which declares no type of its own. */
+function isTypeExtension(node: Node): boolean {
+  return node.language === 'fsharp' && node.decorators?.includes('extension') === true;
+}
+
+/** The dotted paths of the type extensions of `written` (a type's name or path) that a reference can see. */
+function visibleExtensions(written: string, scope: FsharpRefScope, context: ResolutionContext): string[] {
+  const simple = lastSegmentOf(written).replace(/<.*$/, '');
+  const name = FSHARP_TYPE_ABBREVIATIONS[simple] ?? simple;
+  const local = { ...scope, qualifiers: [], receivers: null };
+  return (extensionsByName(context).get(name) ?? [])
+    .filter((n) => isFsharpCandidateReachable(local, { ...scopeOfCandidate(n, context), kind: 'module' }))
+    .map((n) => n.qualifiedName.split('::').join('.'));
+}
+
+const EXTENSIONS = new WeakMap<ResolutionContext, Map<string, Node[]>>();
+
+/** The project's F# type extensions by the simple name of the type they extend, read once per context. */
+function extensionsByName(context: ResolutionContext): Map<string, Node[]> {
+  let byName = EXTENSIONS.get(context);
+  if (byName) return byName;
+  byName = new Map();
+  for (const n of context.getNodesByKind('class')) {
+    if (!isTypeExtension(n)) continue;
+    const extended = lastSegmentOf(n.name).replace(/<.*$/, '');
+    byName.set(extended, [...(byName.get(extended) ?? []), n]);
+  }
+  EXTENSIONS.set(context, byName);
+  return byName;
 }
 
 type ValueType = { kind: 'name'; name: string } | { kind: 'path'; path: string };
@@ -621,7 +662,7 @@ function reachableTypes(written: string, scope: FsharpRefScope, context: Resolut
   const qualifier = written.length > name.length ? written.slice(0, written.length - name.length - 1) : '';
   const local = { ...scope, qualifiers: qualifier === '' ? [] : [qualifier], receivers: null };
   return context.getNodesByName(name).filter((n) =>
-    SCOPED_LANGUAGES.has(n.language) && TYPE_KINDS.has(n.kind) && n.kind !== 'module' &&
+    SCOPED_LANGUAGES.has(n.language) && TYPE_KINDS.has(n.kind) && n.kind !== 'module' && !isTypeExtension(n) &&
     (n.language !== 'fsharp' || isFsharpCandidateReachable(local, scopeOfCandidate(n, context))));
 }
 
@@ -782,6 +823,7 @@ function dotnetFileScopeOf(ref: UnresolvedRef, context: ResolutionContext, read:
 export function clearFsharpScopeCaches(context: ResolutionContext): void {
   DOTNET_FILE_SCOPES.delete(context);
   DOTNET_TARGETS.delete(context);
+  EXTENSIONS.delete(context);
   COMPILED_NAMES.delete(context);
   FILE_SCOPES.delete(context);
   DECLARED_NAMESPACES.delete(context);
@@ -848,7 +890,7 @@ export function matchDotnetNameInFsharp(ref: UnresolvedRef, context: ResolutionC
   const named = context.getNodesByLowerName(name.toLowerCase());
   const allowed = DOTNET_TARGET_KINDS[ref.referenceKind];
   const declared = [...named, ...compiledNamed(name, context)]
-    .filter((n) => n.language === 'fsharp' && !NON_SYMBOL_KINDS.has(n.kind) && (!allowed || allowed.has(n.kind)));
+    .filter((n) => n.language === 'fsharp' && !NON_SYMBOL_KINDS.has(n.kind) && !isTypeExtension(n) && (!allowed || allowed.has(n.kind)));
   if (declared.length === 0) return null;
   const file = dotnetFileScopeOf(ref, context, read);
   if (!file) return null;
@@ -977,6 +1019,8 @@ export function isFsharpCandidateInScope(
   if (!SYMBOL_REFERENCE_KINDS.has(ref.referenceKind) || NON_SYMBOL_KINDS.has(candidate.kind)) return true;
   // A call invokes something; a module is a scope — in any file, so a `module Order` beside `type Order` is not its constructor.
   if (ref.referenceKind === 'calls' && candidate.kind === 'module') return false;
+  // `type System.String with …` adds members; it declares no type a name could mean.
+  if (isTypeExtension(candidate)) return false;
 
   const sameFile = candidate.filePath === ref.filePath;
   const refScope = scopeOfRef(ref, context);

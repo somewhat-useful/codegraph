@@ -1151,6 +1151,34 @@ module Ops =
     let Limit = 10
     let inc x = x + 1
 `,
+      'Ext.fs': `namespace Ext
+
+[<AutoOpen>]
+module StringExt =
+    type System.String with
+        member s.Shout() = s.ToUpper()
+
+type Order(total: decimal) =
+    member _.Total = total
+
+module OrderExt =
+    type Order with
+        member o.Doubled() = o.Total * 2m
+`,
+      'UseExt.fs': `module UseExt
+
+open Ext
+open Ext.OrderExt
+
+let shout (s: string) = s.Shout()
+let doubled (o: Order) = o.Doubled()
+let mention (x: String) = x
+let make () = String('a', 3)
+`,
+      'NoOpenExt.fs': `module NoOpenExt
+
+let doubled (o: Ext.Order) = o.Doubled()
+`,
       'UseCalc.fs': `module UseCalc
 
 open Calc
@@ -1206,6 +1234,17 @@ let limit () = Ops.Limit
     expect(edgesOf('UseCalc.fs', 'backPipe', 'calls')).toEqual(['Calc::Ops::inc']);
     expect(edgesOf('UseCalc.fs', 'composed', 'references')).toEqual(['Calc::Ops::inc', 'Calc::Ops::inc']);
     expect(edgesOf('UseCalc.fs', 'limit', 'references')).toEqual(['Calc::Ops::Limit']);
+  });
+
+  it('links a member a type extension adds, where the extension is in scope', () => {
+    expect(edgesOf('UseExt.fs', 'shout', 'calls')).toEqual(['Ext::StringExt::System.String::Shout']);
+    expect(edgesOf('UseExt.fs', 'doubled', 'calls')).toEqual(['Ext::OrderExt::Order::Doubled']);
+    expect(edgesOf('NoOpenExt.fs', 'doubled', 'calls')).toEqual([]);
+  });
+
+  it('never takes a type extension for a declaration of the type it extends', () => {
+    expect(edgesOf('UseExt.fs', 'mention', 'references')).toEqual([]);
+    expect(edgesOf('UseExt.fs', 'make', 'instantiates')).toEqual([]);
   });
 
   it('links `base.M()` to the member of the type inherited', () => {
