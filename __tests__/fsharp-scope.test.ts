@@ -10,7 +10,7 @@
  * exist in every library) is never what the name means. A private binding and
  * the top of a script stay in their file, and a call never lands on a module.
  *
- * C# and VB.NET reach F# by their own lookup: an F# module is a static class,
+ * C# reaches F# by its own lookup: an F# module is a static class,
  * so its functions are written through it (`Pricing.discount`), or bare under
  * `using static`; F# types are seen through the namespaces the file is in or
  * imports.
@@ -719,7 +719,6 @@ describe('isFsharpReachableFromDotnet', () => {
     usings: new Set(['Shop.Domain']),
     aliases: new Map(),
     statics: new Set(),
-    ignoreCase: false,
     ...over,
   });
   const target = (over: Partial<DotnetTarget>): DotnetTarget => ({
@@ -774,12 +773,6 @@ describe('isFsharpReachableFromDotnet', () => {
     expect(isFsharpReachableFromDotnet(file(), 'Confirm', confirm)).toBe(false);
   });
 
-  it('reads a VB.NET scope without regard to case', () => {
-    const vb = file({ namespaces: ['shop.reports'], usings: new Set(['shop.domain']), statics: new Set(['shop.domain']), ignoreCase: true });
-    expect(isFsharpReachableFromDotnet(vb, 'PRICING.Discount', discount)).toBe(true);
-    expect(isFsharpReachableFromDotnet(vb, 'customer', customer)).toBe(true);
-  });
-
   it('never reaches the top of a script; reaches a type of the global namespace from anywhere', () => {
     expect(isFsharpReachableFromDotnet(file(), 'Build.run', target({ reachable: false, namespace: '', container: 'Build', name: 'run' }))).toBe(false);
     const global = target({ namespace: '', container: '', name: 'Gt', kind: 'class' });
@@ -787,7 +780,7 @@ describe('isFsharpReachableFromDotnet', () => {
   });
 });
 
-describe('C# and VB.NET calls into F#', () => {
+describe('C# calls into F#', () => {
   let dir = '';
   let project: CodeGraph;
 
@@ -885,27 +878,6 @@ namespace Near.Web
     }
 }
 `,
-      'Vb/Nested.vb': `Namespace Shop
-    Namespace Reports
-        Public Class Nested
-            Public Function Run(p As Decimal) As Decimal
-                Return Domain.Pricing.discount(0.1D, p)
-            End Function
-        End Class
-    End Namespace
-End Namespace
-`,
-      'Vb/Report.vb': `Imports Shop.Domain
-
-Namespace Shop.Reports
-    Public Class Report
-        Public Function Run(p As Decimal) As Decimal
-            Dim c = New Customer("n", "e")
-            Return Pricing.discount(0.1D, p)
-        End Function
-    End Class
-End Namespace
-`,
     };
     for (const [rel, content] of Object.entries(files)) {
       fs.mkdirSync(path.dirname(path.join(dir, rel)), { recursive: true });
@@ -936,11 +908,6 @@ End Namespace
     expect(edgesOf('Web/Controller.cs', 'Build', 'calls')).toEqual(['Shop.Domain::Order::Confirm']);
   });
 
-  it('links a VB.NET call and construction through `Imports`', () => {
-    expect(edgesOf('Vb/Report.vb', 'Run', 'calls')).toEqual(['Shop.Domain::Pricing::discount']);
-    expect(edgesOf('Vb/Report.vb', 'Run', 'instantiates')).toEqual(['Shop.Domain::Customer']);
-  });
-
   it('links nothing a C# file does not import: not a bare module function, not another namespace\'s module', () => {
     expect(edgesOf('Web/NoUsing.cs', 'Run', 'calls')).toEqual([]);
   });
@@ -965,14 +932,10 @@ End Namespace
     expect(edgesOf('Near/Web/Billing.cs', 'Make', 'instantiates')).toEqual(['Near::Invoice']);
   });
 
-  it('reads a VB.NET namespace nested in another as the path of both', () => {
-    expect(edgesOf('Vb/Nested.vb', 'Run', 'calls')).toEqual(['Shop.Domain::Pricing::discount']);
-  });
-
   it('shows the C# callers of an F# function', () => {
     const discountNode = project.getNodesInFile('Domain/Pricing.fs').find((n) => n.name === 'discount')!;
     const callers = project.getCallers(discountNode.id).map((c) => c.node.filePath).sort();
-    expect(callers).toEqual(['Vb/Nested.vb', 'Vb/Report.vb', 'Web/Controller.cs', 'Web/Controller.cs', 'Web/Controller.cs']);
+    expect(callers).toEqual(['Web/Controller.cs', 'Web/Controller.cs', 'Web/Controller.cs']);
   });
 });
 
@@ -1383,7 +1346,7 @@ public class Draw
   });
 });
 
-describe('F# reads a file top to bottom, picks an overload by its arguments, and C# and VB.NET bind by their own lookup', () => {
+describe('F# reads a file top to bottom, picks an overload by its arguments, and C# binds by its own lookup', () => {
   let dir = '';
   let project: CodeGraph;
 
@@ -1452,22 +1415,6 @@ namespace Shop.Web { class Page { void Render() { Pricing.discount(1); var c = n
       'Other.cs': `using Shop.Domain;
 namespace Elsewhere { class Report { void Run() { Pricing.ApplyDiscount(1); var c = new Customer(); } void Closed() { Shop.Helpers.tidy(1); Shop.Pricing.inner(1); } } }
 `,
-      'Web.vb': `Imports Shop.Domain
-Namespace Shop.Web
-  Class VPage
-    Sub Render()
-      Pricing.discount(1)
-    End Sub
-  End Class
-End Namespace
-Namespace Elsewhere
-  Class VReport
-    Sub Run()
-      Pricing.applydiscount(1)
-    End Sub
-  End Class
-End Namespace
-`,
     };
     for (const [rel, content] of Object.entries(files)) fs.writeFileSync(path.join(dir, rel), content);
     project = await CodeGraph.init(dir, { index: true });
@@ -1511,14 +1458,9 @@ End Namespace
     expect(edgesOf('App.fs', 'run')).toEqual(['fsharp:global::Util::helper@3']);
   });
 
-  it('lets a C# or VB.NET namesake in a namespace around the code win over F# reached through a using', () => {
+  it('lets a C# namesake in a namespace around the code win over F# reached through a using', () => {
     expect(edgesOf('Web.cs', 'Render', ['calls', 'instantiates']).sort()).toEqual(['csharp:Shop.Web::Customer@1', 'csharp:Shop.Web::Pricing::discount@1']);
-    expect(edgesOf('Web.vb', 'Render')).not.toContain('fsharp:Shop.Domain::Pricing::discount@4');
     expect(edgesOf('Other.cs', 'Run', ['calls', 'instantiates']).sort()).toEqual(['fsharp:Shop.Domain::Customer@5', 'fsharp:Shop.Domain::Pricing::discount@4']);
-  });
-
-  it('reaches a `[<CompiledName>]` from VB.NET in any case', () => {
-    expect(edgesOf('Web.vb', 'Run')).toEqual(['fsharp:Shop.Domain::Pricing::discount@4']);
   });
 
   it('never links C# to what F# keeps inside its assembly: a private module\'s contents, an internal binding', () => {

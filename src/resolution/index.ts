@@ -38,7 +38,7 @@ import { clearCppTypeAliasMemos } from './cpp-type-aliases';
 import { adoptProjectScans, readProjectScans, type ProjectScans } from './project-scans';
 import { clearCppIncluderMemos } from './cpp-includers';
 import { clearCMacroRenames } from './c-macro-renames';
-import { isObjcDeclaredTypeRef, matchByExactName, matchDotnetNameIntoFsharp } from './name-matcher';
+import { isObjcDeclaredTypeRef, matchByExactName } from './name-matcher';
 import { fsharpConfigFiles, fsprojCompileItems, isFsharpCompiledName, matchFsharpRecordConstruction, signatureNames } from './fsharp-scope';
 import { clearCFeatureVariantMemos } from './c-feature-variants';
 import { clearAmbientModuleMemos, ambientModuleDeclarations } from './ambient-modules';
@@ -1867,8 +1867,8 @@ export class ReferenceResolver {
       (CASE_INSENSITIVE_LANGUAGES.has(ref.language) && this.hasAnyPossibleMatchIgnoringCase(existenceName)) ||
       this.matchesAnyImport(ref) ||
       this.frameworksFor(ref.language).some((f) => f.claimsReference?.(ref.referenceName)) ||
-      // C# and VB.NET call an F# function by its `[<CompiledName>]`, which no node is named.
-      ((ref.language === 'csharp' || ref.language === 'vbnet') &&
+      // C# calls an F# function by its `[<CompiledName>]`, which no node is named.
+      (ref.language === 'csharp' &&
         isFsharpCompiledName(existenceName.slice(existenceName.lastIndexOf('.') + 1), this.context));
     if (this.profileStages) this.stageAdd('preFilter', ref, preFilterPass, tPre);
     if (!preFilterPass) {
@@ -1881,10 +1881,9 @@ export class ReferenceResolver {
     // whose declared type's member it links — and no framework, import or
     // name strategy guesses past that. Nor past a `With` block's call through
     // a receiver path (`.Run()` in `With Me._h`).
-    // What VB.NET's scoping finds no VB.NET declaration for may be an F# module's or type's, as VB.NET sees it.
-    if (isVbMemberRead(ref)) return this.gateLanguage(matchVbMemberRead(ref, this.context) ?? matchDotnetNameIntoFsharp(ref, this.context), ref);
+    if (isVbMemberRead(ref)) return this.gateLanguage(matchVbMemberRead(ref, this.context), ref);
     if (isVbPathCall(ref)) {
-      return this.gateLanguage(matchVbPathCall(ref, this.context, (name) => isStdMethodName('vbnet', name)) ?? matchDotnetNameIntoFsharp(ref, this.context), ref);
+      return this.gateLanguage(matchVbPathCall(ref, this.context, (name) => isStdMethodName('vbnet', name)), ref);
     }
 
     // The last name of a TypeScript type written qualified (`React.ReactNode`,

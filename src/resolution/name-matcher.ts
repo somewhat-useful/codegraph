@@ -15,7 +15,7 @@ import { JS_ARRAY_METHODS, JS_BROWSER_HOST_GLOBALS, JS_BUILT_INS, JS_BUILTIN_MET
 import { SWIFT_TYPE_PATH_CALL, resolveSwiftTypePathCall } from './swift-type-visibility';
 import { dartImportPrefixes, dartLibrarySees, dartPrefixSees, dartPrivateVisible, inSameDartLibrary } from './dart-libraries';
 import { isDartLocallyBound } from './dart-local-scope';
-import { breakVbTie, isVbMemberInScope, isVbNestedTypeInScope, isVbTypeQualifiedBy, matchVbTypedCall, preferVbProject, sameVbProject, vbImportScope } from './vbnet-receivers';
+import { breakVbTie, isVbMemberInScope, isVbNestedTypeInScope, isVbTypeQualifiedBy, matchVbTypedCall, preferVbProject, sameVbProject } from './vbnet-receivers';
 import { cppAliasedClass, cppAliasedTypeName, cppAliasedTypeWritten, cppDeclaresLocalAlias, cppParentScope, cppScopesWithin, cppTemplateArguments, cppTemplateParameters, cppTypeNamesDeclared, cppTypeSegments, isCppPointerType, resolveCppAliasedType, stripCppTemplateArguments, type CppAliasedType } from './cpp-type-aliases';
 import { clearCppNamespaceMemos, cppMacroNamespaceFrames, cppMacroNamespaceHeads, cppNameMacros, cppNamespaceAliases } from './cpp-namespaces';
 import { clearCppRawStringMemos, cppLiteralsBlanked, cppNonCodeLines } from './cpp-raw-strings';
@@ -8080,28 +8080,20 @@ function csharpNamespaceScope(file: string, context: ResolutionContext): { names
   return scope;
 }
 
-/** The F# declaration a C# or VB.NET name means, by that language's lookup (see `matchDotnetNameInFsharp`). */
-export function matchDotnetNameIntoFsharp(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
+/** The F# declaration a C# name means, by C#'s lookup (see `matchDotnetNameInFsharp`). */
+function matchDotnetNameIntoFsharp(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
   return matchDotnetNameInFsharp(ref, context, dotnetScopeForFsharp);
 }
 
 /**
- * What a C# or VB.NET file can name, for F#'s check of a name it writes
+ * What a C# file can name, for F#'s check of a name it writes
  * (`isFsharpReachableFromDotnet`): the same namespaces, usings and aliases the
- * C# and VB.NET lookups here use, and the full paths of its `using static`.
+ * C# lookups here use, and the full paths of its `using static`.
  */
 function dotnetScopeForFsharp(ref: UnresolvedRef, context: ResolutionContext): DotnetFileScope | null {
-  if (ref.language === 'csharp') {
-    const scope = csharpNamespaceScope(ref.filePath, context);
-    return { namespaces: scope.namespaces, usings: scope.usings, aliases: scope.aliases, statics: csharpStaticUsingPaths(ref.filePath, context), ignoreCase: false };
-  }
-  if (ref.language === 'vbnet') {
-    // VB.NET imports a module or type as it imports a namespace: its shared members are then seen bare.
-    const scope = vbImportScope(ref.filePath, context);
-    const imports = new Set(scope.imports);
-    return { namespaces: scope.namespaces, usings: imports, aliases: scope.aliases, statics: imports, ignoreCase: true };
-  }
-  return null;
+  if (ref.language !== 'csharp') return null;
+  const scope = csharpNamespaceScope(ref.filePath, context);
+  return { namespaces: scope.namespaces, usings: scope.usings, aliases: scope.aliases, statics: csharpStaticUsingPaths(ref.filePath, context) };
 }
 
 /**
@@ -32767,10 +32759,10 @@ function matchReferenceInner(
   result = nmTimed('methodCall', ref, () => matchMethodCall(ref, context));
   if (result) return result;
 
-  // 2b. A C# or VB.NET name of an F# declaration: an F# module is a static
-  // class to them, its functions no class's methods, so the strategies above
-  // never find them. After their own lookup, so a C# or VB.NET namesake wins.
-  if (ref.language === 'csharp' || ref.language === 'vbnet') {
+  // 2b. A C# name of an F# declaration: an F# module is a static class to C#,
+  // its functions no class's methods, so the strategies above never find them.
+  // After C#'s own lookup, so a C# namesake wins.
+  if (ref.language === 'csharp') {
     result = nmTimed('dotnetToFsharp', ref, () => matchDotnetNameIntoFsharp(ref, context));
     if (result) return result;
   }

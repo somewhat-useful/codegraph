@@ -1332,7 +1332,7 @@ export class CodeGraph {
             this.resolver.resetModuleConfig();
             let reopened = 0;
             // An F# signature decides only what its own `.fs` shows: re-open the edges into that file, from
-            // F#, C# and VB.NET, and the parked references naming what it declares — not every reference.
+            // F# and C#, and the parked references naming what it declares — not every reference.
             const signatures = changed.filter((rel) => /\.fsi$/i.test(rel));
             for (const language of moduleConfigLanguages(changed.filter((rel) => !/\.fsi$/i.test(rel)))) {
               reopened += this.orchestrator.resurrectResolutionEdgesForLanguage(language);
@@ -1340,7 +1340,7 @@ export class CodeGraph {
             for (const signature of signatures) {
               const implementation = signature.slice(0, -1);
               const declared = [...new Set(this.queries.getNodesByFile(implementation).map((n) => n.name))];
-              for (const language of ['fsharp', 'csharp', 'vbnet'] as const) {
+              for (const language of ['fsharp', 'csharp'] as const) {
                 reopened += this.orchestrator.resurrectResolutionEdgesTouching(language, { targetFiles: [implementation], sourceDirs: [], moduleLeaves: declared }).length;
               }
             }
