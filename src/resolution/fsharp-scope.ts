@@ -30,6 +30,8 @@
  * member of a type in such a namespace.
  */
 
+import * as fs from 'fs';
+import * as path from 'path';
 import type { Node } from '../types';
 import type { ResolutionContext, ResolvedRef, UnresolvedRef } from './types';
 
@@ -824,6 +826,7 @@ export function clearFsharpScopeCaches(context: ResolutionContext): void {
   DOTNET_FILE_SCOPES.delete(context);
   DOTNET_TARGETS.delete(context);
   EXTENSIONS.delete(context);
+  COMPILE_ORDERS.delete(context);
   COMPILED_NAMES.delete(context);
   FILE_SCOPES.delete(context);
   DECLARED_NAMESPACES.delete(context);
@@ -993,6 +996,61 @@ export function matchFsharpRecordConstruction(ref: UnresolvedRef, context: Resol
   return { original: ref, targetNodeId: built[0]!.id, confidence: 0.9, resolvedBy: 'exact-match' };
 }
 
+const COMPILE_ORDERS = new WeakMap<ResolutionContext, Map<string, Map<string, number> | null>>();
+
+/**
+ * The compilation order of the F# project around `file`: its project file's
+ * `<Compile Include>` items, in order, by project-relative path. F# sees in a
+ * file only what the files before it in that order declare. Null when no
+ * project file above the file lists it.
+ */
+function compileOrderOf(file: string, context: ResolutionContext): Map<string, number> | null {
+  let byDir = COMPILE_ORDERS.get(context);
+  if (!byDir) COMPILE_ORDERS.set(context, (byDir = new Map()));
+  const root = context.getProjectRoot();
+  for (let dir = path.posix.dirname(file); ; dir = path.posix.dirname(dir)) {
+    const key = dir === '.' ? '' : dir;
+    let order = byDir.get(key);
+    if (order === undefined) {
+      order = null;
+      let entries: string[] = [];
+      try {
+        entries = fs.readdirSync(path.join(root, key));
+      } catch {
+        entries = [];
+      }
+      const project = entries.find((e) => /\.fsproj$/i.test(e));
+      if (project) {
+        let text = '';
+        try {
+          text = fs.readFileSync(path.join(root, key, project), 'utf8');
+        } catch {
+          text = '';
+        }
+        order = new Map();
+        let index = 0;
+        for (const m of text.matchAll(/<Compile\s+Include\s*=\s*"([^"*?]+)"/gi)) {
+          const listed = path.posix.normalize(path.posix.join(key, m[1]!.replace(/\\/g, '/')));
+          if (!order.has(listed)) order.set(listed, index++);
+        }
+      }
+      byDir.set(key, order);
+    }
+    if (order && order.has(file)) return order;
+    if (order) return null;
+    if (key === '') return null;
+  }
+}
+
+/** Whether `candidate`'s file comes after `ref`'s in the F# project that compiles both, so `ref` cannot see it. */
+function isCompiledLater(candidate: Node, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  if (candidate.filePath === ref.filePath) return false;
+  const order = compileOrderOf(ref.filePath, context);
+  const at = order?.get(ref.filePath);
+  const candidateAt = order?.get(candidate.filePath);
+  return at !== undefined && candidateAt !== undefined && candidateAt > at;
+}
+
 /** Is `candidate` something `ref` can mean? Always true for refs and candidates F# has nothing to say about. */
 export function isFsharpCandidateInScope(
   candidate: Node,
@@ -1021,6 +1079,8 @@ export function isFsharpCandidateInScope(
   if (ref.referenceKind === 'calls' && candidate.kind === 'module') return false;
   // `type System.String with …` adds members; it declares no type a name could mean.
   if (isTypeExtension(candidate)) return false;
+  // A file sees only what the files compiled before it declare.
+  if (candidate.language === 'fsharp' && isCompiledLater(candidate, ref, context)) return false;
 
   const sameFile = candidate.filePath === ref.filePath;
   const refScope = scopeOfRef(ref, context);

@@ -1257,3 +1257,58 @@ let limit () = Ops.Limit
     expect(edgesOf('Web.cs', 'Run', 'calls')).toEqual(['Dom::compute']);
   });
 });
+
+describe('F# compilation order', () => {
+  let dir = '';
+  let project: CodeGraph;
+
+  beforeAll(async () => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-fsharp-order-'));
+    const files: Record<string, string> = {
+      'App/App.fsproj': `<Project Sdk="Microsoft.NET.Sdk">
+  <ItemGroup>
+    <Compile Include="Util.fs" />
+    <Compile Include="Early.fs" />
+    <Compile Include="Late.fs" />
+  </ItemGroup>
+</Project>
+`,
+      'App/Util.fs': `module Util
+
+let helper x = x
+`,
+      'App/Early.fs': `module Early
+
+let useUtil () = Util.helper 1
+let useLate () = Late.helper 1
+`,
+      'App/Late.fs': `module Late
+
+let helper x = x * 2
+let useEarly () = Early.useUtil ()
+`,
+    };
+    for (const [rel, content] of Object.entries(files)) {
+      fs.mkdirSync(path.dirname(path.join(dir, rel)), { recursive: true });
+      fs.writeFileSync(path.join(dir, rel), content);
+    }
+    project = await CodeGraph.init(dir, { index: true });
+  });
+
+  afterAll(() => {
+    project?.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  const callsOf = (file: string, name: string): string[] => {
+    const id = project.getNodesInFile(file).find((n) => n.name === name)!.id;
+    return project.getOutgoingEdgesFrom([id]).filter((e) => e.kind === 'calls').map((e) => project.getNode(e.target)!.qualifiedName);
+  };
+
+  it('links what files compiled before a file declare, and nothing a later file does', () => {
+    expect(callsOf('App/Early.fs', 'useUtil')).toEqual(['Util::helper']);
+    expect(callsOf('App/Late.fs', 'useEarly')).toEqual(['Early::useUtil']);
+    // `Late.fs` is compiled after `Early.fs`: F# does not see its `Late.helper` there.
+    expect(callsOf('App/Early.fs', 'useLate')).toEqual([]);
+  });
+});
