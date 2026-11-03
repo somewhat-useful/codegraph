@@ -79,6 +79,8 @@ export interface FsharpRefScope {
   opens: readonly string[];
   /** Types the file opens with `open type`: their static members, nested types and union cases are in scope bare. */
   openTypes?: readonly string[];
+  /** The full paths the opens name, read against what the project declares, with the line each is opened on. */
+  openedPaths?: readonly { path: string; line: number }[];
   /** Qualifiers the name is written with, aliases expanded: `Calc` in `Calc.helper`, `x` in `x.Add`. */
   qualifiers: readonly string[];
   /** The name is written through a capitalised path whose head the project does not declare: `System.Threading.Tasks.Task.Run`. */
@@ -162,17 +164,41 @@ function namesContainer(qualifier: string): boolean {
  * `open Shop` then `open Core` opens the module `Shop.Core` (F# refuses that
  * for a namespace, FS0893, so code that compiles names a module there).
  */
-function openedPaths(prefixes: readonly string[], opens: readonly { name: string; line: number }[]): { path: string; line: number }[] {
+function openedPaths(
+  prefixes: readonly string[],
+  opens: readonly { name: string; line: number }[],
+  declared?: ReadonlySet<string>,
+): { path: string; line: number }[] {
   const out: { path: string; line: number }[] = [];
-  const bases = new Set<string>(prefixes);
+  const bases: string[] = [...prefixes];
   for (const { name, line } of opens) {
-    const reached = [...bases].map((base) => joinPath(base, name));
-    for (const path of reached) {
-      out.push({ path, line });
-      bases.add(path);
-    }
+    const reached = [...new Set(bases.map((base) => joinPath(base, name)))];
+    // An `open` names one namespace or module: of the paths it could be, the ones the project
+    // declares, else the path as written (a namespace outside the project, `open System.Text`).
+    // Without the project's declarations at hand, every reading is kept, and none is built on.
+    const opened = declared ? reached.filter((p) => declared.has(p)) : reached;
+    for (const path of opened.length > 0 ? opened : [name]) out.push({ path, line });
+    if (declared) for (const path of opened) if (!bases.includes(path)) bases.push(path);
   }
   return out;
+}
+
+const DECLARED_SCOPES = new WeakMap<ResolutionContext, Set<string>>();
+
+/** The dotted paths of every namespace and module the project declares, and of the namespaces around them. */
+function declaredScopes(context: ResolutionContext): Set<string> {
+  let paths = DECLARED_SCOPES.get(context);
+  if (paths) return paths;
+  paths = new Set();
+  for (const kind of ['namespace', 'module'] as const) {
+    for (const n of context.getNodesByKind(kind)) {
+      if (!SCOPED_LANGUAGES.has(n.language)) continue;
+      const full = n.qualifiedName.split('::').join('.');
+      for (const prefix of scopePrefixes(full)) if (prefix !== '') paths.add(prefix);
+    }
+  }
+  DECLARED_SCOPES.set(context, paths);
+  return paths;
 }
 
 const RESOLVED_SCOPES = new WeakMap<FsharpRefScope, { prefixes: string[]; opens: Set<string>; openTypes: Set<string> }>();
@@ -182,8 +208,8 @@ function resolvedScopes(ref: FsharpRefScope): { prefixes: string[]; opens: Set<s
   const cached = RESOLVED_SCOPES.get(ref);
   if (cached) return cached;
   const prefixes = scopePrefixes(ref.container);
-  const opens = new Set<string>();
-  for (const { path } of openedPaths(prefixes, ref.opens.map((name) => ({ name, line: 0 })))) opens.add(path);
+  const opened = ref.openedPaths ?? openedPaths(prefixes, ref.opens.map((name) => ({ name, line: 0 })));
+  const opens = new Set<string>(opened.map(({ path }) => path));
   // `open type T` names `T` as written, relative to the scopes around the reference and to what is opened.
   const openTypes = new Set<string>();
   for (const name of ref.openTypes ?? []) for (const base of [...prefixes, ...opens]) openTypes.add(joinPath(base, name));
@@ -525,6 +551,11 @@ function scopeOfRef(ref: UnresolvedRef, context: ResolutionContext): FsharpRefSc
     qualifiers,
     externalQualifier: qualifiers.length > 0 && qualifiers.every((q) => isExternalPath(q, context)),
   };
+  scope.openedPaths = openedPaths(
+    scopePrefixes(container),
+    file.opens.filter((entry) => importApplies(entry, ref)).map(({ node }) => ({ name: node.name, line: node.endLine })),
+    declaredScopes(context),
+  );
   REF_SCOPES.set(ref, scope);
   const onValue = qualifiers.find((q) => q !== '_' && (!namesContainer(q) || q.includes('.')));
   if (onValue !== undefined) scope.receivers = receiversOf(onValue, ref, from, scope, context);
@@ -844,6 +875,7 @@ export function clearFsharpScopeCaches(context: ResolutionContext): void {
   EXTENSIONS.delete(context);
   COMPILE_ORDERS.delete(context);
   SIGNATURES.delete(context);
+  DECLARED_SCOPES.delete(context);
   COMPILED_NAMES.delete(context);
   FILE_SCOPES.delete(context);
   DECLARED_NAMESPACES.delete(context);
@@ -938,13 +970,9 @@ export function matchDotnetNameInFsharp(ref: UnresolvedRef, context: ResolutionC
 export function latestFsharpBindings(candidates: Node[], ref: UnresolvedRef, context: ResolutionContext): Node[] {
   if (ref.language !== 'fsharp' || candidates.length < 2) return candidates;
   const scope = scopeOfRef(ref, context);
-  const file = fileScopeOf(ref.filePath, context);
   // Where each path became visible through an `open` read relative to the scopes around the reference.
   const openedAt = new Map<string, number>();
-  const applying = file.opens.filter((entry) => importApplies(entry, ref)).map(({ node }) => ({ name: node.name, line: node.endLine }));
-  for (const { path, line } of openedPaths(scopePrefixes(scope.container), applying)) {
-    openedAt.set(path, Math.max(openedAt.get(path) ?? -1, line));
-  }
+  for (const { path, line } of scope.openedPaths ?? []) openedAt.set(path, Math.max(openedAt.get(path) ?? -1, line));
   const visibleFrom = (path: string, declaredAt: number, sameFile: boolean): number => {
     if (path === '' || path === GLOBAL_NAMESPACE) return 0;
     const opened = openedAt.get(path) ?? -1;

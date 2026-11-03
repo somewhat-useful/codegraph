@@ -75,6 +75,14 @@ describe('isFsharpCandidateReachable', () => {
     expect(isFsharpCandidateReachable(ref({ qualifiers: ['repo'], receivers: null }), save('Shop.Core.Repo'))).toBe(false);
   });
 
+  it('reads many opens in linear time, each naming one declared namespace or module', () => {
+    // Twenty opens of outside namespaces: once read as every joining of the ones before, they doubled each time.
+    const many = ref({ opens: Array.from({ length: 20 }, (_, i) => `System.N${i}`) });
+    const started = Date.now();
+    expect(isFsharpCandidateReachable(many, candidate('Shop.Core'))).toBe(true);
+    expect(Date.now() - started).toBeLessThan(1000);
+  });
+
   it('reads an open relative to the scope it is written in', () => {
     expect(isFsharpCandidateReachable(ref({ container: 'Shop.App', opens: ['Lib'] }), candidate('Shop.Lib'))).toBe(true);
     expect(isFsharpCandidateReachable(ref({ container: 'Shop.App', opens: ['Library'] }), candidate('Shop.Lib'))).toBe(false);
