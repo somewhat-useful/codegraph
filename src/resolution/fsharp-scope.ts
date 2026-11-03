@@ -12,11 +12,16 @@
  *   alias): the container whose full path that is, taken as written, relative
  *   to an `open`, or relative to a scope enclosing the reference;
  * - through a value (`x.Add`), or a chain of properties (`Settings.Current.Save`):
- *   a member of some type. Its type is whatever inference says, so it is
- *   reached by name within the neighbourhood the file can see.
+ *   a member of the value's type, then of what that type inherits. The type is
+ *   the one the value's binding states: a local's, as the extractor read it from
+ *   the syntax tree (the reference's `candidates`), or a declaration's — a
+ *   module's or a class's `let`, a function, a member — its `returnType`, read
+ *   where that declaration is written. A member of a value the source does not
+ *   type is never guessed.
  *
- * The extractor keeps only the last segment of a qualified callee, so the
- * qualifier is read back from the source, at the reference's own position.
+ * The extractor records each name as written (`Calc.helper`, `r.Save`, `_.Add`
+ * for a member on an expression) at the name itself, so the resolver reads no
+ * source text to find a qualifier.
  *
  * A same-named function in a namespace none of that reaches — `map`, `bind`,
  * `format` — is never what the name means.
@@ -34,7 +39,6 @@ import * as fs from 'fs';
 import * as path from 'path';
 import type { Node } from '../types';
 import type { ResolutionContext, ResolvedRef, UnresolvedRef } from './types';
-import { escapeRegExp } from '../utils';
 
 /** Reference kinds that name a declaration (an `open` names a namespace, which is not a symbol). */
 const SYMBOL_REFERENCE_KINDS: ReadonlySet<string> = new Set([
@@ -77,6 +81,8 @@ const GLOBAL_NAMESPACE = 'global';
 
 /** Where a reference is written, and what its file brings into reach. */
 export interface FsharpRefScope {
+  /** The file the reference is written in. */
+  filePath?: string;
   /** Dotted path of the scopes around the reference. */
   container: string;
   /** The namespace the reference's file declares it in. */
@@ -235,11 +241,17 @@ function declaredScopes(context: ResolutionContext): Set<string> {
   return paths;
 }
 
-const RESOLVED_SCOPES = new WeakMap<FsharpRefScope, { prefixes: string[]; opens: Set<string>; openTypes: Set<string> }>();
+const RESOLVED_SCOPES = new WeakMap<object, { prefixes: string[]; opens: Set<string>; openTypes: Set<string> }>();
 
-/** The scopes around a reference and its opens, the latter also read relative to those scopes (`open Core` in `namespace Shop`). */
+/**
+ * The scopes around a reference and its opens, the latter also read relative to
+ * those scopes (`open Core` in `namespace Shop`). They depend on where the
+ * reference is, not on what it is written through: the scopes derived from one
+ * (`{ ...scope, qualifiers }`) share its `openedPaths`, and the reading with it.
+ */
 function resolvedScopes(ref: FsharpRefScope): { prefixes: string[]; opens: Set<string>; openTypes: Set<string> } {
-  const cached = RESOLVED_SCOPES.get(ref);
+  const key: object = ref.openedPaths ?? ref;
+  const cached = RESOLVED_SCOPES.get(key);
   if (cached) return cached;
   const prefixes = scopePrefixes(ref.container);
   const opened = ref.openedPaths ?? openedPaths(prefixes, ref.opens.map((name) => ({ name, line: 0 })));
@@ -248,7 +260,7 @@ function resolvedScopes(ref: FsharpRefScope): { prefixes: string[]; opens: Set<s
   const openTypes = new Set<string>();
   for (const name of ref.openTypes ?? []) for (const base of [...prefixes, ...opens]) openTypes.add(joinPath(base, name));
   const resolved = { prefixes, opens, openTypes };
-  RESOLVED_SCOPES.set(ref, resolved);
+  RESOLVED_SCOPES.set(key, resolved);
   return resolved;
 }
 
@@ -458,74 +470,52 @@ function isNameChar(ch: string | undefined): boolean {
   return ch !== undefined && /[\p{L}\p{N}_']/u.test(ch);
 }
 
-/** Index of the first mention of `name` as a whole word in `line` at or after `from`, or -1. */
-function indexOfWord(line: string, name: string, from: number): number {
-  for (let at = line.indexOf(name, from); at >= 0; at = line.indexOf(name, at + 1)) {
-    if (!isNameChar(line[at - 1]) && !isNameChar(line[at + name.length])) return at;
-  }
-  return -1;
-}
-
-/** How far below the reference's own line its name may be written: a pipeline continues on the next lines. */
-const QUALIFIER_WINDOW = 8;
-
-/** The longest qualifier read back; anything longer is not a name. */
-const MAX_QUALIFIER = 240;
-
 /**
- * Read the qualifier written just before `line[at]`: `Utils` in `Utils.helper`,
- * `Other.Lib.Fn` in `Other.Lib.Fn.helper`. Empty when the name is bare, `_` when
- * what precedes the dot is not a name (`(f x).Add`, `xs.[0].Add`). Reads backwards
- * from the name, so a long line costs only the qualifier.
+ * The segments of a written name path: `Calc.helper` → ['Calc', 'helper']. A
+ * dot inside ``a.b`` or an operator's parentheses (`(+.)`) belongs to the name.
  */
-function qualifierBefore(line: string, at: number): string | null {
-  let i = at - 1;
-  while (i >= 0 && line[i] === ' ') i--;
-  if (line[i] !== '.') return null;
+function pathSegments(written: string): string[] {
   const segments: string[] = [];
-  const stop = Math.max(-1, i - MAX_QUALIFIER);
-  while (line[i] === '.' && i > stop) {
-    i--;
-    while (i >= 0 && line[i] === ' ') i--;
-    let start: number;
-    if (line[i] === '`' && line[i - 1] === '`') {
-      start = line.lastIndexOf('``', i - 2);
-      if (start < 0 || start <= stop) return '_';
-    } else {
-      start = i;
-      while (start >= 0 && start > stop && isNameChar(line[start])) start--;
-      start++;
-      if (start > i) return '_';
+  let start = 0;
+  let depth = 0;
+  let quoted = false;
+  for (let i = 0; i < written.length; i++) {
+    if (written.startsWith('``', i)) {
+      quoted = !quoted;
+      i++;
+    } else if (!quoted) {
+      if (written[i] === '(') depth++;
+      else if (written[i] === ')') depth--;
+      else if (written[i] === '.' && depth === 0) {
+        segments.push(written.slice(start, i));
+        start = i + 1;
+      }
     }
-    segments.unshift(line.slice(start, i + 1));
-    i = start - 1;
-    while (i >= 0 && line[i] === ' ') i--;
   }
-  return segments.join('.');
+  segments.push(written.slice(start));
+  return segments;
+}
+
+/** The name a reference means, without what it is written through: `helper` of `Calc.helper`, `Add` of `_.Add`. */
+function referencedName(ref: UnresolvedRef): string {
+  const segments = pathSegments(ref.referenceName);
+  return segments[segments.length - 1] ?? ref.referenceName;
 }
 
 /**
- * The qualifier a reference's name is written with, aliases expanded: a module
- * alias (`module F = Other.Lib.Fn`) is replaced by what it names. The reference
- * points at the start of its expression, so the name is looked for from there on
- * its line and on the few lines below it, and the first mention is the one.
+ * The qualifier a reference is written with — what its name, as the extractor
+ * records it, carries before its last segment — its head a module alias
+ * expanded to what it names (`module F = Other.Lib.Fn`): `Calc` of
+ * `Calc.helper`, `r` of `r.Save`, `_` of a member on an expression (`_.Add`).
+ * None for a bare name, an operator or a record expression.
  */
-function writtenQualifiers(ref: UnresolvedRef, aliases: ReadonlyMap<string, string>, context: ResolutionContext): string[] {
-  const lines = context.getFileLines?.(ref.filePath) ?? context.readFile(ref.filePath)?.split(/\r?\n/) ?? [];
-  for (let i = 0; i < QUALIFIER_WINDOW; i++) {
-    const line = lines[ref.line - 1 + i];
-    if (line === undefined) break;
-    let at = indexOfWord(line, ref.referenceName, i === 0 ? Math.min(ref.column, line.length) : 0);
-    if (at < 0 && i === 0) at = indexOfWord(line, ref.referenceName, 0);
-    if (at < 0) continue;
-    const written = qualifierBefore(line, at);
-    if (written === null || written === '') return [];
-    if (written === '_') return ['_'];
-    const [head = '', ...rest] = written.split('.');
-    const target = aliases.get(head);
-    return [target ? [target, ...rest].join('.') : written];
-  }
-  return [];
+function writtenQualifiers(ref: UnresolvedRef, aliases: ReadonlyMap<string, string>): string[] {
+  if (ref.referenceName.startsWith('{')) return [];
+  const segments = pathSegments(ref.referenceName);
+  if (segments.length < 2) return [];
+  const [head = '', ...rest] = segments.slice(0, -1);
+  const target = aliases.get(head);
+  return [target ? [target, ...rest].join('.') : [head, ...rest].join('.')];
 }
 
 const DECLARED_NAMESPACES = new WeakMap<ResolutionContext, Map<string, string>>();
@@ -572,75 +562,140 @@ function scopeOfRef(ref: UnresolvedRef, context: ResolutionContext): FsharpRefSc
     : OWN_SCOPE_KINDS.has(from.kind)
       ? from.qualifiedName.split('::').join('.')
       : containerOfNode(from);
-  const aliases = new Map(file.aliases.filter((entry) => importApplies(entry, ref))
-    .map(({ node }) => [node.name, node.signature!]));
-  const qualifiers = writtenQualifiers(ref, aliases, context);
+  const opens = file.opens.filter((entry) => importApplies(entry, ref));
+  const aliases = new Map(file.aliases.filter((entry) => importApplies(entry, ref)).map(({ node }) => [node.name, node.signature!]));
+  const qualifiers = writtenQualifiers(ref, aliases);
   const scope: FsharpRefScope = {
+    filePath: ref.filePath,
     container,
     namespace: from && from.kind !== 'file' ? declaredNamespace(from, context) : '',
-    opens: file.opens.filter((entry) => importApplies(entry, ref)).map(({ node }) => node.name),
+    opens: opens.map(({ node }) => node.name),
     openTypes: file.openTypes.filter((entry) => importApplies(entry, ref)).map(({ node }) => node.name),
+    openedPaths: openedPaths(scopePrefixes(container), opens.map(({ node }) => ({ name: node.name, line: node.endLine })), declaredScopes(context)),
     qualifiers,
     externalQualifier: qualifiers.length > 0 && qualifiers.every((q) => isExternalPath(q, context)),
   };
-  scope.openedPaths = openedPaths(
-    scopePrefixes(container),
-    file.opens.filter((entry) => importApplies(entry, ref)).map(({ node }) => ({ name: node.name, line: node.endLine })),
-    declaredScopes(context),
-  );
   REF_SCOPES.set(ref, scope);
-  const onValue = qualifiers.find((q) => q !== '_' && (!namesContainer(q) || q.includes('.')));
-  if (onValue !== undefined) scope.receivers = receiversOf(onValue, ref, from, scope, context);
+  const onValue = qualifiers.find((q) => q === '_' || !namesContainer(q) || q.includes('.'));
+  if (onValue !== undefined) scope.receivers = receiversOf(ref, onValue, scope, context);
   return scope;
 }
 
-/** A type written in an annotation or a construction, without its generic arguments: `Repo<int>` → `Repo`. */
-const TYPE_NAME = String.raw`([A-Za-z_\x60][\w.\x60']*)`;
+/** How far a value's type is followed through what other declarations return. */
+const MAX_TYPE_DEPTH = 6;
 
 /**
- * The type of the value `written` names at `ref`, as F# types it, with what it
- * inherits: the dotted paths of those types, or null when F# would know it and
- * the source does not say. Read from what the source states — never from the
- * name of the member the value is used with.
+ * The types a member written on a value can belong to (`r.Save`, `this.Step`,
+ * `Settings.Current.Save`), nearest first: the value's own type, then what it
+ * inherits, then the type extensions in scope. The value's type is the one the
+ * extractor read from its binding (`candidates`: `Repo.Save` for `r: Repo`),
+ * else, for a path to a module value, what that value's declaration says it
+ * holds. Null when F# would know it and the source does not say.
  */
-function receiversOf(written: string, ref: UnresolvedRef, from: Node | undefined, scope: FsharpRefScope, context: ResolutionContext): string[] | null {
-  // `base.Speak()` in a member is the inherited type's member: the supertypes of the type it is declared in.
-  if (written === 'base') return from && MEMBER_KINDS.has(from.kind) ? baseTypesOf(containerOfNode(from), context) : null;
-  const typeName = written.includes('.') ? pathValueType(written, scope, context) : localValueType(written, ref, from, context);
-  if (typeName === null) return null;
-  const types = typeName.kind === 'path' ? [typeName.path] : reachableTypes(typeName.name, scope, context);
+function receiversOf(ref: UnresolvedRef, qualifier: string, scope: FsharpRefScope, context: ResolutionContext): string[] | null {
+  let owners: string[];
+  if (ref.candidates) owners = ref.candidates.map((c) => pathSegments(c).slice(0, -1).join('.')).filter((o) => o !== '');
+  else if (qualifier === '_') return null;
+  else owners = [qualifier];
+  if (owners.length === 0) return null;
+  const paths: string[] = [];
+  const add = (path: string): void => {
+    if (!paths.includes(path)) paths.push(path);
+  };
+  const extended = new Set<string>();
+  for (const owner of owners) {
+    const types = typesOfPath(owner, scope, context, 0);
+    for (const path of typeAndAncestors(types, context)) add(path);
+    for (const type of types) extended.add(type.name);
+    if (types.length === 0) extended.add(lastSegmentOf(owner));
+  }
   // `type System.String with member s.Shout() = …` adds members to a type, a project's or not,
   // where the extension is in scope.
-  const extensions = visibleExtensions(typeName.kind === 'path' ? typeName.path : typeName.name, scope, context);
-  if (types.length === 0 && extensions.length === 0) return null;
-  const paths = new Set<string>(extensions);
-  const visit = (node: Node, depth: number): void => {
-    const path = node.qualifiedName.split('::').join('.');
-    if (paths.has(path) || depth > 8) return;
-    paths.add(path);
-    for (const parent of context.getSupertypeNodes?.(node.id) ?? []) visit(parent, depth + 1);
-  };
-  for (const type of types) {
-    if (typeof type === 'string') paths.add(type);
-    else visit(type, 0);
-  }
-  return [...paths];
+  for (const name of extended) for (const path of visibleExtensions(name, scope, context)) add(path);
+  return paths.length > 0 ? paths : null;
 }
 
-/** The dotted paths of what the type at `path` inherits or implements, and what those do in turn. */
-function baseTypesOf(path: string, context: ResolutionContext): string[] | null {
-  const types = context.getNodesByQualifiedName(path.split('.').join('::')).filter((n) => TYPE_KINDS.has(n.kind) && n.kind !== 'module');
-  const paths = new Set<string>();
-  const visit = (node: Node, depth: number): void => {
-    for (const parent of context.getSupertypeNodes?.(node.id) ?? []) {
-      const parentPath = parent.qualifiedName.split('::').join('.');
-      if (paths.has(parentPath) || depth > 8) continue;
-      paths.add(parentPath);
-      visit(parent, depth + 1);
+/** The dotted paths of `types` and of what they inherit or implement, each type before its ancestors. */
+function typeAndAncestors(types: readonly Node[], context: ResolutionContext): string[] {
+  const paths: string[] = [];
+  let level = [...types];
+  for (let depth = 0; level.length > 0 && depth <= 8; depth++) {
+    const next: Node[] = [];
+    for (const type of level) {
+      const path = type.qualifiedName.split('::').join('.');
+      if (paths.includes(path)) continue;
+      paths.push(path);
+      next.push(...(context.getSupertypeNodes?.(type.id) ?? []));
     }
-  };
-  for (const type of types) visit(type, 0);
-  return paths.size > 0 ? [...paths] : null;
+    level = next;
+  }
+  return paths;
+}
+
+/** Declarations a path can stand for as a value: what they hold, or what a call of them returns, is their `returnType`. */
+const VALUE_KINDS: ReadonlySet<string> = new Set(['function', 'method', 'property', 'field', 'variable', 'constant', 'enum_member']);
+
+/**
+ * The project types `path` evaluates to where `scope` is: the type it names,
+ * else the result type of the value, function or member it names — a union
+ * case's union — each read by F#'s scope rules where that declaration is
+ * written. `Repo` → the type `Repo`; `Repo.Load` → what `Repo`'s `Load`
+ * returns; `Settings.Current` → what the module value `Current` holds.
+ */
+function typesOfPath(path: string, scope: FsharpRefScope, context: ResolutionContext, depth: number): Node[] {
+  if (depth > MAX_TYPE_DEPTH || path === '') return [];
+  const asType = reachableTypes(path, scope, context);
+  if (asType.length > 0) return asType;
+  const segments = pathSegments(path);
+  const last = segments.pop()!;
+  return valuesAt(last, segments.join('.'), scope, context, depth).flatMap((value) => resultTypes(value, context, depth + 1));
+}
+
+/** The declarations named `name` that `prefix.name` (bare when `prefix` is empty) can mean as a value where `scope` is. */
+function valuesAt(name: string, prefix: string, scope: FsharpRefScope, context: ResolutionContext, depth: number): Node[] {
+  const named = context.getNodesByName(name).filter((n) => SCOPED_LANGUAGES.has(n.language) && VALUE_KINDS.has(n.kind));
+  const at = (qualifiers: string[]): FsharpRefScope => ({ ...scope, qualifiers, receivers: null });
+  const reach = (qualifiers: string[]) => (n: Node): boolean =>
+    isFsharpCandidateReachable(at(qualifiers), scopeOfCandidate(n, context), n.filePath === scope.filePath);
+  if (prefix === '') return named.filter((n) => n.language === 'fsharp' && reach([])(n));
+  // Through a module or a type: `Settings.Current`, `Repo.Default`.
+  const through = named.filter(reach([prefix]));
+  if (through.length > 0) return through;
+  // On a value: a member of what the prefix evaluates to, the nearest type's first.
+  const owners = typeAndAncestors(typesOfPath(prefix, scope, context, depth + 1), context);
+  const members = named.filter((n) => MEMBER_KINDS.has(n.kind) && owners.includes(containerOfNode(n)));
+  const nearest = Math.min(...members.map((n) => owners.indexOf(containerOfNode(n))));
+  return members.filter((n) => owners.indexOf(containerOfNode(n)) === nearest);
+}
+
+/** The project types a value, function or member yields, read where it is declared; a union case yields its union. */
+function resultTypes(value: Node, context: ResolutionContext, depth: number): Node[] {
+  if (value.kind === 'enum_member') {
+    const owner = value.qualifiedName.slice(0, value.qualifiedName.lastIndexOf('::'));
+    return context.getNodesByQualifiedName(owner).filter((n) => n.kind === 'union');
+  }
+  return value.returnType ? typesOfPath(value.returnType, scopeAtNode(value, context), context, depth) : [];
+}
+
+const NODE_SCOPES = new WeakMap<ResolutionContext, Map<string, FsharpRefScope>>();
+
+/** The scope a declaration is written in, as for a name written at its own position: what its file opens there. */
+function scopeAtNode(node: Node, context: ResolutionContext): FsharpRefScope {
+  let perContext = NODE_SCOPES.get(context);
+  if (!perContext) NODE_SCOPES.set(context, (perContext = new Map()));
+  const cached = perContext.get(node.id);
+  if (cached) return cached;
+  const scope = scopeOfRef({
+    fromNodeId: node.id,
+    referenceName: '',
+    referenceKind: 'references',
+    line: node.startLine,
+    column: node.startColumn,
+    filePath: node.filePath,
+    language: 'fsharp',
+  }, context);
+  perContext.set(node.id, scope);
+  return scope;
 }
 
 /** F#'s names for .NET types: an annotation `(s: string)` is a `System.String`. */
@@ -655,12 +710,12 @@ function isTypeExtension(node: Node): boolean {
   return node.language === 'fsharp' && node.decorators?.includes('extension') === true;
 }
 
-/** The dotted paths of the type extensions of `written` (a type's name or path) that a reference can see. */
-function visibleExtensions(written: string, scope: FsharpRefScope, context: ResolutionContext): string[] {
-  const simple = lastSegmentOf(written).replace(/<.*$/, '');
-  const name = FSHARP_TYPE_ABBREVIATIONS[simple] ?? simple;
+/** The dotted paths of the type extensions of the type named `name` that a reference can see. */
+function visibleExtensions(name: string, scope: FsharpRefScope, context: ResolutionContext): string[] {
+  const simple = name.replace(/<.*$/, '');
+  const extended = FSHARP_TYPE_ABBREVIATIONS[simple] ?? simple;
   const local = { ...scope, qualifiers: [], receivers: null };
-  return (extensionsByName(context).get(name) ?? [])
+  return (extensionsByName(context).get(extended) ?? [])
     .filter((n) => isFsharpCandidateReachable(local, { ...scopeOfCandidate(n, context), kind: 'module' }))
     .map((n) => n.qualifiedName.split('::').join('.'));
 }
@@ -679,46 +734,6 @@ function extensionsByName(context: ResolutionContext): Map<string, Node[]> {
   }
   EXTENSIONS.set(context, byName);
   return byName;
-}
-
-type ValueType = { kind: 'name'; name: string } | { kind: 'path'; path: string };
-
-/** The type a bare value name has where `ref` is written: a self identifier, a parameter, a local or a module value. */
-function localValueType(name: string, ref: UnresolvedRef, from: Node | undefined, context: ResolutionContext): ValueType | null {
-  const lines = context.getFileLines?.(ref.filePath) ?? context.readFile(ref.filePath)?.split(/\r?\n/) ?? [];
-  const word = escapeRegExp(name);
-  if (from && from.kind !== 'file') {
-    // `member x.Run() = x.Step()`: the self identifier is the type the member is declared in.
-    const head = lines.slice(from.startLine - 1, from.startLine + 1).join(' ');
-    const self = new RegExp(String.raw`\bmember\s+(?:(?:private|internal|public|static|inline)\s+)*${word}\s*\.`).test(head) ||
-      new RegExp(String.raw`\b(?:override|default)\s+${word}\s*\.`).test(head);
-    if (self && MEMBER_KINDS.has(from.kind)) return { kind: 'path', path: containerOfNode(from) };
-    // `(r: Repo)`: a parameter's annotation.
-    const parameter = new RegExp(String.raw`(?:^|[\s(,])${word}\s*:\s*${TYPE_NAME}`).exec(from.signature ?? '');
-    if (parameter) return { kind: 'name', name: parameter[1]! };
-    // The nearest `let` or `use` of the name above the reference, in the symbol's body.
-    const bound = new RegExp(String.raw`\b(?:let|use)!?\s+(?:mutable\s+)?${word}\s*(?::\s*${TYPE_NAME}[^=]*)?=\s*(?:new\s+)?${TYPE_NAME}?\s*(?:<[^>\n]*>)?\s*(\()?`);
-    for (let line = ref.line; line >= from.startLine; line--) {
-      const m = bound.exec(lines[line - 1] ?? '');
-      if (!m) continue;
-      if (m[1]) return { kind: 'name', name: m[1] };
-      return m[2] && m[3] && /^(?:\p{Lu}|\x60)/u.test(lastSegmentOf(m[2])) ? { kind: 'name', name: m[2] } : null;
-    }
-  }
-  return null;
-}
-
-/** The type of a module value written by its path (`Settings.Current`): what its initializer constructs. */
-function pathValueType(path: string, scope: FsharpRefScope, context: ResolutionContext): ValueType | null {
-  const name = lastSegmentOf(path);
-  const owner = path.slice(0, path.length - name.length - 1);
-  const values = context.getNodesByName(name).filter((n) =>
-    n.language === 'fsharp' && (n.kind === 'variable' || n.kind === 'constant') &&
-    (containerOfNode(n) === owner || containerOfNode(n).endsWith(`.${owner}`)) &&
-    isFsharpCandidateReachable({ ...scope, qualifiers: [owner], receivers: null }, scopeOfCandidate(n, context)));
-  if (values.length !== 1) return null;
-  const constructed = new RegExp(String.raw`^=\s*(?:new\s+)?${TYPE_NAME}\s*(?:<[^>]*>)?\s*\(`).exec(values[0]!.signature ?? '');
-  return constructed && /^(?:\p{Lu}|\x60)/u.test(lastSegmentOf(constructed[1]!)) ? { kind: 'name', name: constructed[1]! } : null;
 }
 
 /** The project types a type name written at a reference can mean, by F#'s scope rules for that reference. */
@@ -907,6 +922,7 @@ export function clearFsharpScopeCaches(context: ResolutionContext): void {
   COMPILED_NAMES.delete(context);
   DOTNET_NAMESPACES.delete(context);
   ASSEMBLY_INTERNAL.delete(context);
+  NODE_SCOPES.delete(context);
   PRIVATE_SCOPES.delete(context);
   FSHARP_FILES.delete(context);
   FILE_SCOPES.delete(context);
@@ -1202,7 +1218,7 @@ function leadingParenGroup(text: string): string | null {
  * types of the literals among them. All of them when the call says too little.
  */
 function overloadsFitting(overloads: Node[], ref: UnresolvedRef, context: ResolutionContext): Node[] {
-  const args = callArguments(ref, overloads[0]!.name, context);
+  const args = callArguments(ref, context);
   if (args === null) return overloads;
   const scored = overloads.map((n) => {
     const group = leadingParenGroup((n.signature ?? '').trim());
@@ -1233,21 +1249,59 @@ function overloadsFitting(overloads: Node[], ref: UnresolvedRef, context: Resolu
   return scored.filter((s) => s.score === best).map((s) => s.n);
 }
 
-/** The arguments a call to `name` at `ref` passes: `(1, "a")` → ['1', '"a"'], `()` → [], `M x` → ['x']; null when unread. */
-function callArguments(ref: UnresolvedRef, name: string, context: ResolutionContext): string[] | null {
+/**
+ * The arguments the call `ref` passes, read where the extractor placed it — at
+ * the called name — from what follows the name: `(1, "a")` → ['1', '"a"'],
+ * `()` → [], `M x` → ['x']. An argument list may run on over the lines below.
+ * Null when what follows is no argument list.
+ */
+function callArguments(ref: UnresolvedRef, context: ResolutionContext): string[] | null {
   const lines = fileLines(ref.filePath, context);
-  for (let i = 0; i < QUALIFIER_WINDOW; i++) {
-    const line = lines[ref.line - 1 + i];
-    if (line === undefined) return null;
-    const at = indexOfWord(line, name, i === 0 ? Math.min(ref.column, line.length) : 0);
-    if (at < 0) continue;
-    const rest = line.slice(at + name.length).trimStart();
-    const group = leadingParenGroup(rest);
-    if (group !== null) return group.trim() === '' ? [] : splitTopLevel(group);
-    const token = /^(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])'|[^\s)\]|,;]+)/.exec(rest);
-    return token ? [token[0]] : null;
+  const name = referencedName(ref);
+  const line = lines[ref.line - 1] ?? '';
+  if (line.slice(ref.column, ref.column + name.length) !== name) return null;
+  let rest = line.slice(ref.column + name.length).trimStart();
+  for (let next = ref.line; rest.startsWith('(') && leadingParenGroup(rest) === null && next < lines.length && next < ref.line + 40; next++) {
+    rest += ` ${lines[next]!.trim()}`;
   }
-  return null;
+  const group = leadingParenGroup(rest);
+  if (group !== null) return group.trim() === '' ? [] : splitTopLevel(group);
+  const token = /^(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])'|[^\s)\]|,;]+)/.exec(rest);
+  return token ? [token[0]] : null;
+}
+
+/** Reference kinds that name a type: only a type can be what they mean. */
+const TYPE_REFERENCE_KINDS: ReadonlySet<string> = new Set(['extends', 'implements', 'type_of', 'returns']);
+
+/** Whether `ref` is an F# name of a declaration, which F#'s own lookup (`matchFsharpReference`) resolves, and nothing else. */
+export function isFsharpSymbolReference(ref: UnresolvedRef): boolean {
+  return ref.language === 'fsharp' && SYMBOL_REFERENCE_KINDS.has(ref.referenceKind);
+}
+
+/**
+ * The declaration an F# name means, by F#'s lookup: the declarations of its
+ * name that its scope can reach (`isFsharpCandidateInScope`), the one that
+ * became visible last (`latestFsharpBindings`), and of a member written on a
+ * value, the one of the value's own type before those of the types it
+ * inherits. Null unless one declaration is meant: silent beats wrong.
+ */
+export function matchFsharpReference(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
+  if (ref.referenceName.startsWith('{')) return matchFsharpRecordConstruction(ref, context);
+  const typeOnly = TYPE_REFERENCE_KINDS.has(ref.referenceKind);
+  const reached = context.getNodesByName(referencedName(ref)).filter((n) =>
+    (!typeOnly || (TYPE_KINDS.has(n.kind) && n.kind !== 'module')) && isFsharpCandidateInScope(n, ref, context));
+  let ranked = latestFsharpBindings(reached, ref, context);
+  // A member on a value is looked up in the value's type, then in what that type inherits.
+  const receivers = scopeOfRef(ref, context).receivers;
+  if (receivers && ranked.length > 1) {
+    const depth = (n: Node): number => (MEMBER_KINDS.has(n.kind) ? receivers.indexOf(containerOfNode(n)) : -1);
+    const nearest = Math.min(...ranked.map(depth).filter((d) => d >= 0));
+    if (Number.isFinite(nearest)) ranked = ranked.filter((n) => depth(n) === nearest);
+  }
+  if (ranked.length === 0 || ranked.some((n) => n.qualifiedName !== ranked[0]!.qualifiedName)) return null;
+  // A type and its module share a qualified name: a name used as a value or a type means the type.
+  const target = ranked.find((n) => n.kind !== 'module') ?? ranked[0]!;
+  return { original: ref, targetNodeId: target.id, confidence: 0.9, resolvedBy: 'exact-match' };
 }
 
 /**
@@ -1266,12 +1320,10 @@ export function matchFsharpRecordConstruction(ref: UnresolvedRef, context: Resol
   const labels = (copy ? copy[2]! : written[1]!).split(';');
   let types: Node[];
   if (copy) {
-    const from = context.getNodeById?.(ref.fromNodeId) ?? undefined;
-    const valueType = copy[1]!.includes('.') ? pathValueType(copy[1]!, scope, context) : localValueType(copy[1]!, ref, from, context);
-    if (!valueType) return null;
-    types = valueType.kind === 'path'
-      ? context.getNodesByQualifiedName(valueType.path.split('.').join('::')).filter((n) => TYPE_KINDS.has(n.kind))
-      : reachableTypes(valueType.name, scope, context);
+    // What is copied has the type its binding states (the extractor's `candidates`), or that a module value holds.
+    const copied = ref.candidates ? ref.candidates[0] : copy[1]!;
+    if (copied === undefined) return null;
+    types = typesOfPath(copied, scope, context, 0).filter((n) => TYPE_KINDS.has(n.kind) && n.kind !== 'module');
   } else if (labels[0]!.includes('.')) {
     const first = labels[0]!;
     labels[0] = lastSegmentOf(first);
@@ -1287,7 +1339,7 @@ export function matchFsharpRecordConstruction(ref: UnresolvedRef, context: Resol
   }
   const hasField = (type: Node, label: string): boolean =>
     context.getNodesByName(label).some((f) => f.kind === 'field' && f.qualifiedName === `${type.qualifiedName}::${label}`);
-  const built = latestFsharpBindings(types.filter((t) => labels.every((label) => hasField(t, label))), { ...ref, referenceName: '' }, context);
+  const built = latestFsharpBindings(types.filter((t) => labels.every((label) => hasField(t, label))), ref, context);
   if (built.length === 0 || built.some((t) => t.qualifiedName !== built[0]!.qualifiedName)) return null;
   return { original: ref, targetNodeId: built[0]!.id, confidence: 0.9, resolvedBy: 'exact-match' };
 }

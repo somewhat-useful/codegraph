@@ -39,7 +39,7 @@ import { adoptProjectScans, readProjectScans, type ProjectScans } from './projec
 import { clearCppIncluderMemos } from './cpp-includers';
 import { clearCMacroRenames } from './c-macro-renames';
 import { isObjcDeclaredTypeRef, matchByExactName } from './name-matcher';
-import { fsharpConfigFiles, fsprojCompileItems, isFsharpCompiledName, matchFsharpRecordConstruction, signatureNames } from './fsharp-scope';
+import { fsharpConfigFiles, fsprojCompileItems, isFsharpCompiledName, isFsharpSymbolReference, matchFsharpReference, signatureNames } from './fsharp-scope';
 import { clearCFeatureVariantMemos } from './c-feature-variants';
 import { clearAmbientModuleMemos, ambientModuleDeclarations } from './ambient-modules';
 import { matchShopifyThemeFile } from './shopify-themes';
@@ -1298,6 +1298,7 @@ export class ReferenceResolver {
       filePath: ref.filePath || this.getFilePathFromNodeId(ref.fromNodeId),
       language: ref.language || this.getLanguageFromNodeId(ref.fromNodeId),
       rowId: ref.rowId,
+      ...(ref.candidates ? { candidates: ref.candidates } : {}),
     }));
 
     const total = refs.length;
@@ -1826,12 +1827,10 @@ export class ReferenceResolver {
     const rustBound = matchRustUseBoundName(ref, this.context);
     if (rustBound !== undefined) return this.gateLanguage(rustBound, ref);
 
-    // An F# record expression, recorded by its labels (`{Name;Email}`), builds the record type F#
-    // infers from them, or nothing: no declaration carries a name in braces, so the pre-filter
-    // below would drop it, and no strategy past it reads one.
-    if (ref.language === 'fsharp' && ref.referenceKind === 'instantiates' && ref.referenceName.startsWith('{')) {
-      return this.gateLanguage(matchFsharpRecordConstruction(ref, this.context), ref);
-    }
+    // An F# name means what F#'s lookup says it does (see matchFsharpReference): the name as
+    // written (`Calc.helper`, `r.Save`, a record's labels `{Name;Email}`) by F#'s scope rules, and
+    // no strategy past here guesses beyond that.
+    if (isFsharpSymbolReference(ref)) return this.gateLanguage(matchFsharpReference(ref, this.context), ref);
 
     // Fast pre-filter: skip if no symbol with this name exists anywhere
     // AND the name doesn't match a local import. The import escape is
@@ -2513,6 +2512,7 @@ export class ReferenceResolver {
         filePath: raw.filePath || this.getFilePathFromNodeId(raw.fromNodeId),
         language: raw.language || this.getLanguageFromNodeId(raw.fromNodeId),
         rowId: raw.rowId,
+        ...(raw.candidates ? { candidates: raw.candidates } : {}),
       };
       const result = this.resolveOneTimed(ref);
       if (result) {
@@ -2633,6 +2633,7 @@ export class ReferenceResolver {
         filePath: raw.filePath || this.getFilePathFromNodeId(raw.fromNodeId),
         language: raw.language || this.getLanguageFromNodeId(raw.fromNodeId),
         rowId: raw.rowId,
+        ...(raw.candidates ? { candidates: raw.candidates } : {}),
       };
       const result = this.resolveOneTimed(ref);
       if (result) {

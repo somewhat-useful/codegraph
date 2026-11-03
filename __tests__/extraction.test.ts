@@ -582,7 +582,8 @@ type Derived(x: int) =
     const from = (kind: string) =>
       result.unresolvedReferences.filter((r) => r.referenceKind === kind && r.fromNodeId === derived.id).map((r) => r.referenceName);
     expect(from('extends')).toEqual(['Base']);
-    expect(from('implements')).toEqual(['IDisposable', 'IComparable']);
+    // A type is named as written: the resolver reads the path by F#'s scope rules.
+    expect(from('implements')).toEqual(['System.IDisposable', 'IComparable']);
     // The members of an interface implementation are the type's own.
     expect(kindsAndNames(result)).toEqual(
       expect.arrayContaining(['method M::Derived::Dispose', 'method M::Derived::CompareTo'])
@@ -703,10 +704,11 @@ let run xs =
 `;
     const result = extractFromSource('M.fs', code);
 
-    expect(refs(result, 'calls')).toEqual(expect.arrayContaining(['map', 'sum', 'ignore', 'info', 'compute']));
+    // A callee is recorded as written, its qualifier with it.
+    expect(refs(result, 'calls')).toEqual(expect.arrayContaining(['List.map', 'Seq.sum', 'ignore', 'Logger.info', 'compute']));
     // `Helpers.double` is handed to `List.map`, not called here.
-    expect(refs(result, 'calls')).not.toContain('double');
-    expect(refs(result, 'references')).toContain('double');
+    expect(refs(result, 'calls')).not.toContain('Helpers.double');
+    expect(refs(result, 'references')).toContain('Helpers.double');
   });
 
   it('should reference the types a signature names, and skip primitives', () => {
@@ -894,11 +896,11 @@ let total (o: Order) (rate: Rate) : Money = Money 0
     const result = extractFromSource('M.fs', code);
     const calls = refs(result, 'calls');
 
-    expect(calls).toContain('EmitZ32');
-    expect(calls).not.toContain('Length');
+    expect(calls).toContain('bb.EmitZ32');
+    expect(calls.filter((c) => c.endsWith('Length'))).toEqual([]);
     // A function handed on through its module is a reference to it, not a call.
-    expect(calls).not.toContain('information');
-    expect(refs(result, 'references')).toContain('information');
+    expect(calls).not.toContain('LogEvent.information');
+    expect(refs(result, 'references')).toContain('LogEvent.information');
   });
 
   it('should find the callee that follows an infix operator, and a pipe once', () => {
@@ -1007,8 +1009,8 @@ let total (o: Order) (rate: Rate) : Money = Money 0
     const code = ['module M', '', 'let q = Deep.deep ()', 'let r xs = List.map (fun z -> z) xs', 'let s = plain 1', ''].join(String.fromCharCode(10));
     const calls = refs(extractFromSource('M.fs', code), 'calls');
 
-    expect(calls.filter((c) => c === 'deep')).toHaveLength(1);
-    expect(calls.filter((c) => c === 'map')).toHaveLength(1);
+    expect(calls.filter((c) => c === 'Deep.deep')).toHaveLength(1);
+    expect(calls.filter((c) => c === 'List.map')).toHaveLength(1);
     expect(calls.filter((c) => c === 'plain')).toHaveLength(1);
   });
 
@@ -1031,7 +1033,7 @@ let total (o: Order) (rate: Rate) : Money = Money 0
       'let qualified (f: int) = Util.f f',
       '',
     ].join(nl);
-    expect(refs(extractFromSource('M.fs', shadowed), 'calls').sort()).toEqual(['f', 'go']);
+    expect(refs(extractFromSource('M.fs', shadowed), 'calls').sort()).toEqual(['Util.f', 'go']);
   });
 
   it('should keep a dot inside an operator or a backticked name', () => {
@@ -1060,7 +1062,7 @@ let total (o: Order) (rate: Rate) : Money = Money 0
 
   it('should extract the calls a script or a module makes at its top level', () => {
     const script = extractFromSource('build.fsx', 'let build () = 1\nlet test () = 2\nbuild ()\ntest () |> ignore\nTarget.runOrDefault "All"\n');
-    expect(refs(script, 'calls')).toEqual(expect.arrayContaining(['build', 'test', 'runOrDefault']));
+    expect(refs(script, 'calls')).toEqual(expect.arrayContaining(['build', 'test', 'Target.runOrDefault']));
     const fileNode = script.nodes.find((n) => n.kind === 'file')!;
     expect(script.unresolvedReferences.filter((r) => r.referenceName === 'build').map((r) => r.fromNodeId)).toEqual([fileNode.id]);
 

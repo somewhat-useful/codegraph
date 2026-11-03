@@ -1,6 +1,7 @@
 import type { Node as SyntaxNode } from 'web-tree-sitter';
 import { getNodeText } from '../tree-sitter-helpers';
-import type { ExtractorContext, LanguageExtractor } from '../tree-sitter-types';
+import type { BareCall, ExtractorContext, LanguageExtractor } from '../tree-sitter-types';
+import { bindingOf, expressionType, isLocalName, pathOf, receiverPath, typePath } from './fsharp-bindings';
 import type { NodeKind } from '../../types';
 
 /**
@@ -150,7 +151,7 @@ const STANDARD_OPERATORS = new Set([
  * until it is no longer an application. Only report the outermost application —
  * the body walker visits every node, and the nested ones are the same callee.
  */
-function getCalleeName(node: SyntaxNode, source: string): string | null {
+function getCalleeName(node: SyntaxNode, source: string): BareCall | null {
   const parent = node.parent;
   if (parent && parent.type === 'application_expression' && parent.namedChild(0)?.equals(node)) {
     return null;
@@ -166,37 +167,61 @@ function getCalleeName(node: SyntaxNode, source: string): string | null {
   }
   const fn = current.namedChild(0);
   if (!fn) return null;
-  const name = unlessParameter(calleeNameOf(fn, source), node, fn, source);
+  const call = writtenReference(fn, source);
   // `(=)` and `(+)` handed around as values name no project function.
-  const bare = name && name.startsWith('(') && name.endsWith(')') ? name.slice(1, -1) : name;
-  return bare && STANDARD_OPERATORS.has(bare) ? null : name;
+  const bare = call && call.name.startsWith('(') && call.name.endsWith(')') ? call.name.slice(1, -1) : call?.name;
+  return bare && STANDARD_OPERATORS.has(bare) ? null : call;
 }
 
-function calleeNameOf(fn: SyntaxNode, source: string): string | null {
+/** A member on an expression that is no name path (`(f x).Add`, `Box().Add`), as `_.Add`, typed by what the expression evaluates to. */
+function memberOnExpression(fn: SyntaxNode, source: string): BareCall | null {
+  const base = fn.childForFieldName('base');
+  const field = fn.childForFieldName('field');
+  const member = field ? pathOf(field, source) : null;
+  if (!base || !member) return null;
+  const owner = expressionType(base, source);
+  return { name: `_.${member.segments.join('.')}`, at: member.last, candidates: owner === null ? [] : [[owner, ...member.segments].join('.')] };
+}
+
+/**
+ * What a function, a piped-to or a used-as-value expression names, as written:
+ * - a name path (`helper`, `Calc.helper`, `r.Save`, `Other.Lib.Fn.helper`),
+ *   at its last name; null for a parameter or a local, which no declaration is;
+ * - a member on an expression (`(f x).Add`, `Box().Add`) as `_.Add`.
+ * `candidates` carries what a value receiver's type makes the name:
+ * `Repo.Save` for `r.Save` with `r: Repo`; empty when the receiver is a value
+ * the source does not type.
+ */
+function writtenReference(fn: SyntaxNode, source: string): BareCall | null {
   switch (fn.type) {
     case 'long_identifier_or_op':
     case 'long_identifier':
     case 'identifier':
     case 'op_identifier':
-    case 'dot_expression':
-      return lastSegment(txt(fn, source));
-    case 'paren_expression': {
+    case 'dot_expression': {
+      const path = pathOf(fn, source);
+      if (!path && fn.type === 'dot_expression') return memberOnExpression(fn, source);
+      if (!path) return null;
+      const { segments, last } = path;
+      const name = segments.join('.');
+      if (segments.length === 1) return isLocalName(segments[0]!, fn, source) ? null : { name, at: last };
+      if (bindingOf(segments[0]!, fn, source) === undefined) return { name, at: last };
+      const typed = receiverPath(segments, fn, source);
+      return { name, at: last, candidates: typed === null ? [] : [typed] };
+    }
+    case 'paren_expression':
+    case 'typed_expression': {
+      // `(helper) x`; `Baz<int>(3)` and `new Bar<int>(2)`: the type arguments sit beside the name.
       const inner = fn.namedChild(0);
-      return inner && NAME_NODES.has(inner.type) ? lastSegment(txt(inner, source)) : null;
+      return inner ? writtenReference(inner, source) : null;
     }
     case 'infix_expression': {
       // `foo 1 + bar 2` parses as an application whose function part is `foo 1 + bar`:
       // the callee is the last operand. A pipe is extracted from the infix itself.
       const op = fn.namedChildren.find((c) => c.type === 'infix_op');
       if (op && PIPE_OPERATORS.has(txt(op, source))) return null;
-      let last = fn.namedChild(fn.namedChildCount - 1);
-      while (last && last.type === 'infix_expression') last = last.namedChild(last.namedChildCount - 1);
-      return last && (NAME_NODES.has(last.type) || last.type === 'dot_expression') ? lastSegment(txt(last, source)) : null;
-    }
-    case 'typed_expression': {
-      // `Baz<int>(3)` and `new Bar<int>(2)`: the type arguments sit beside the name.
-      const name = fn.namedChild(0);
-      return name && (NAME_NODES.has(name.type) || name.type === 'dot_expression') ? lastSegment(txt(name, source)) : null;
+      const last = fn.namedChild(fn.namedChildCount - 1);
+      return last ? writtenReference(last, source) : null;
     }
     default:
       return null;
@@ -226,114 +251,16 @@ function lastSegment(name: string): string {
   return name.slice(cut + 1);
 }
 
-/** Identifiers a pattern binds, leaving out the types written in it. */
-function collectPatternNames(node: SyntaxNode, source: string, into: Set<string>): void {
-  if (isTypeNode(node) || node.type === 'attributes') return;
-  if (node.type === 'identifier') into.add(txt(node, source));
-  for (const c of node.namedChildren) collectPatternNames(c, source, into);
-}
-
-/** The names a scope node binds for the code inside it, and whether only its `in` continuation sees them. */
-interface ScopeNames {
-  names: ReadonlySet<string>;
-  continuationOnly: boolean;
-}
-
-const NO_NAMES: ScopeNames = { names: new Set(), continuationOnly: false };
-
-/** Per parse tree, what each scope node binds: every bare call asks for every scope around it. */
-const SCOPE_NAMES = new WeakMap<object, Map<number, ScopeNames>>();
-
-/** What `p` binds for the code inside it: parameters, a local `let`, a recursive local function's own name. */
-function scopeNamesOf(p: SyntaxNode, source: string): ScopeNames {
-  let perTree = SCOPE_NAMES.get(p.tree);
-  if (!perTree) SCOPE_NAMES.set(p.tree, (perTree = new Map()));
-  const hit = perTree.get(p.id);
-  if (hit) return hit;
-  const names = new Set<string>();
-  let continuationOnly = false;
-  if (p.type === 'function_or_value_defn') {
-    for (const left of p.namedChildren) {
-      if (left.type !== 'function_declaration_left' && left.type !== 'value_declaration_left') continue;
-      const own = new Set<string>(getBoundNames(left, source));
-      collectPatternNames(left, source, names);
-      for (const n of own) names.delete(n);
-      // A recursive local function refers to itself in its initializer.
-      // Local definitions are not indexed as module-level symbols.
-      if (leadingKeywords(source.slice(p.startIndex, left.startIndex)).includes('rec')) {
-        for (let outer = p.parent; outer; outer = outer.parent) {
-          if (outer.type === 'function_or_value_defn' || outer.type === 'method_or_prop_defn' || outer.type === 'fun_expression') {
-            for (const n of own) names.add(n);
-            break;
-          }
-          if (outer.type === 'named_module' || outer.type === 'module_defn' || outer.type === 'type_definition') break;
-        }
-      }
-    }
-  } else if (p.type === 'fun_expression') {
-    for (const c of p.namedChildren) if (c.type === 'argument_patterns') collectPatternNames(c, source, names);
-  } else if (p.type === 'declaration_expression') {
-    // A local let is visible in its continuation, but not in its own
-    // non-recursive initializer or outside this expression.
-    continuationOnly = true;
-    for (const binding of p.namedChildren) {
-      // `use! c = conn ()` names its value straight under the expression.
-      if (binding.type === 'identifier') names.add(txt(binding, source));
-      if (binding.type !== 'function_or_value_defn') continue;
-      for (const { left } of splitBindings(binding)) {
-        for (const bound of getBoundNames(left, source)) names.add(bound);
-      }
-    }
-  } else if (p.type === 'rule') {
-    // `| Some v -> g v`: what the rule's pattern binds is in scope in the rule.
-    const pattern = p.childForFieldName('pattern');
-    if (pattern) collectPatternNames(pattern, source, names);
-  } else if (p.type === 'for_expression') {
-    // `for x in xs do g x`
-    const pattern = childOfTypes(p, 'identifier_pattern', 'paren_pattern', 'tuple_pattern');
-    if (pattern) collectPatternNames(pattern, source, names);
-  } else if (p.type === 'method_or_prop_defn') {
-    for (const c of p.namedChildren.slice(1, -1)) collectPatternNames(c, source, names);
-  } else {
-    // Primary-constructor parameters stay in scope throughout the type.
-    const constructorArgs = childOfTypes(p, 'primary_constr_args');
-    if (constructorArgs) collectPatternNames(constructorArgs, source, names);
-  }
-  const scope = names.size === 0 ? NO_NAMES : { names, continuationOnly };
-  perTree.set(p.id, scope);
-  return scope;
-}
 
 /**
- * Is `name` a parameter of a function or lambda around `node`? Then `f x` calls
- * the parameter, not a module-level `f`.
+ * What a pipe hands its value to (`x |> f`, `f <| x`) when it is a name path:
+ * it is applied, a union case too (`x |> Circle` builds a `Circle`).
  */
-function isParameterOf(node: SyntaxNode, name: string, source: string): boolean {
-  for (let p = node.parent; p; p = p.parent) {
-    const scope = scopeNamesOf(p, source);
-    if (!scope.names.has(name)) continue;
-    if (!scope.continuationOnly) return true;
-    const continuation = p.childForFieldName('in');
-    if (continuation && node.startIndex >= continuation.startIndex && node.endIndex <= continuation.endIndex) return true;
-  }
-  return false;
-}
-
-/** A bare name that is not one of the enclosing function's parameters. */
-function unlessParameter(name: string | null, at: SyntaxNode, written: SyntaxNode, source: string): string | null {
-  return name !== null && name === txt(written, source) && isParameterOf(at, name, source) ? null : name;
-}
-
-/** The right operand of a `x |> f` infix when it is a bare (possibly dotted) name, with the node that names it. */
-function getPipeCallee(node: SyntaxNode, source: string): { name: string; at: SyntaxNode } | null {
+function getPipeCallee(node: SyntaxNode, source: string): BareCall | null {
   const piped = pipedFunction(node, source);
   if (!piped) return null;
   const target = piped.type === 'paren_expression' ? piped.namedChild(0) : piped;
-  if (!target || !NAME_NODES.has(target.type)) return null;
-  const text = txt(target, source);
-  // What a pipe hands its value to is applied, a union case too: `x |> Circle` builds a `Circle`.
-  const name = unlessParameter(lastSegment(text), node, target, source);
-  return name ? { name, at: target } : null;
+  return target && NAME_NODES.has(target.type) ? writtenReference(target, source) : null;
 }
 
 /** The operand a pipe applies: the right of `x |> f`, the left of `f <| x`. Null for any other infix. */
@@ -353,12 +280,12 @@ function pipedFunction(node: SyntaxNode, source: string): SyntaxNode | null {
  * value (`lo.Length`) is that value's member, a parameter or a local is no
  * declaration, and the function part of an application or a pipe is a call.
  */
-function valueName(node: SyntaxNode, source: string): string | null {
+function valueName(node: SyntaxNode, source: string): BareCall | null {
   if (node.type === 'identifier_pattern') {
     if (!isInMatchRule(node)) return null;
     const head = node.namedChild(0);
-    const name = head && NAME_NODES.has(head.type) ? lastSegment(txt(head, source)) : '';
-    return /^\p{Lu}/u.test(name) ? name : null;
+    const path = head ? pathOf(head, source) : null;
+    return path && /^\p{Lu}/u.test(path.segments[path.segments.length - 1]!) ? { name: path.segments.join('.'), at: path.last } : null;
   }
   // `Lib.Cases2.Done` reads as a `dot_expression` of a path and a field.
   if (node.type !== 'long_identifier' && node.type !== 'long_identifier_or_op' && node.type !== 'dot_expression') return null;
@@ -375,9 +302,9 @@ function valueName(node: SyntaxNode, source: string): string | null {
     // `let a () = Done`, `let limit = Calc.Limit`: the whole body.
     (parent.type === 'function_or_value_defn' && parent.childForFieldName('body')?.equals(node) === true);
   if (!isValue) return null;
-  const text = txt(node, source);
-  if (text.includes('.')) return /^(?:``|\p{Lu})/u.test(text) && !/[([]/.test(text) ? lastSegment(text) : null;
-  return node.type === 'dot_expression' ? null : unlessParameter(text, node, node, source);
+  const ref = writtenReference(node, source);
+  // A member read on a value (`lo.Length`) is that value's own; a module's value or a union case is written through capitals.
+  return ref && (!ref.name.includes('.') || /^(?:``|\p{Lu})/u.test(ref.name)) && ref.candidates === undefined ? ref : null;
 }
 
 /**
@@ -409,7 +336,7 @@ function isNamedArgument(infix: SyntaxNode, source: string): boolean {
  * = … }`), or `{c with Name}` for a copy of the value `c`. Null for anything
  * else in braces (an anonymous record, a computation expression's body).
  */
-function recordConstruction(node: SyntaxNode, source: string): string | null {
+function recordConstruction(node: SyntaxNode, source: string): BareCall | null {
   const block = node.childForFieldName('block') ?? node.namedChild(0);
   if (!block) return null;
   const labelsOf = (initializers: SyntaxNode | null): string[] =>
@@ -419,13 +346,15 @@ function recordConstruction(node: SyntaxNode, source: string): string | null {
       .filter((label) => label !== '');
   if (block.type === 'field_initializers') {
     const labels = labelsOf(block);
-    return labels.length > 0 ? `{${labels.join(';')}}` : null;
+    return labels.length > 0 ? { name: `{${labels.join(';')}}`, at: node } : null;
   }
   if (block.type === 'with_field_expression') {
     const copied = block.namedChild(0);
     const labels = labelsOf(block.childForFieldName('block'));
     if (!copied || labels.length === 0 || !NAME_NODES.has(copied.type)) return null;
-    return `{${txt(copied, source)} with ${labels.join(';')}}`;
+    // A copy builds the type of what it copies, as its binding states it.
+    const type = expressionType(copied, source);
+    return { name: `{${txt(copied, source)} with ${labels.join(';')}}`, at: node, candidates: type === null ? [] : [type] };
   }
   return null;
 }
@@ -457,25 +386,17 @@ function getBoundNames(left: SyntaxNode, source: string): string[] {
 }
 
 /**
- * The type a type expression names, without generic arguments or qualifier:
- * `IComparable<Derived>` → `IComparable`, `System.IDisposable` → `IDisposable`.
- * Null for a type that names no single declaration (function, tuple, array).
+ * The type a type expression names, as written, without type arguments:
+ * `IComparable<Derived>` → `IComparable`, `System.IDisposable` →
+ * `System.IDisposable`, at its last name. Null for a type that names no single
+ * declaration (function, tuple, array).
  */
-function typeRefName(node: SyntaxNode, source: string): string | null {
-  switch (node.type) {
-    case 'long_identifier':
-    case 'long_identifier_or_op':
-    case 'identifier':
-      return lastSegment(txt(node, source)) || null;
-    case 'simple_type':
-    case 'generic_type':
-    case 'paren_type': {
-      const first = node.namedChild(0);
-      return first ? typeRefName(first, source) : null;
-    }
-    default:
-      return null;
-  }
+function typeReference(node: SyntaxNode, source: string): BareCall | null {
+  const name = typePath(node, source);
+  if (!name) return null;
+  let id: SyntaxNode | null = node;
+  while (id && !NAME_NODES.has(id.type)) id = id.namedChild(0);
+  return { name, at: (id && pathOf(id, source)?.last) ?? node };
 }
 
 /** `[<Struct; AbstractClass>]` → ['Struct', 'AbstractClass'] */
@@ -495,14 +416,14 @@ function addTypeRef(
   typeNode: SyntaxNode,
   kind: 'extends' | 'implements',
 ): void {
-  const name = typeRefName(typeNode, ctx.source);
-  if (!name) return;
+  const ref = typeReference(typeNode, ctx.source);
+  if (!ref) return;
   ctx.addUnresolvedReference({
     fromNodeId,
-    referenceName: name,
+    referenceName: ref.name,
     referenceKind: kind,
-    line: typeNode.startPosition.row + 1,
-    column: typeNode.startPosition.column,
+    line: ref.at.startPosition.row + 1,
+    column: ref.at.startPosition.column,
   });
 }
 
@@ -522,20 +443,26 @@ function addTypeReferences(ctx: ExtractorContext, ownerId: string, root: SyntaxN
     if (n.type === 'attributes') continue;
     // A type test's type (`:? Circle`) is an `atomic_type` around the name.
     if (n.type === 'simple_type' || n.type === 'generic_type' || (n.type === 'atomic_type' && n.namedChild(0)?.type === 'long_identifier')) {
-      const name = n.type === 'atomic_type' ? typeRefName(n.namedChild(0)!, ctx.source) : typeRefName(n, ctx.source);
-      if (name && /^\p{Lu}/u.test(name) && !seen.has(name)) {
-        seen.add(name);
-        ctx.addUnresolvedReference({
-          fromNodeId: ownerId,
-          referenceName: name,
-          referenceKind: 'references',
-          line: n.startPosition.row + 1,
-          column: n.startPosition.column,
-        });
+      const ref = typeReference(n, ctx.source);
+      if (ref && /^(?:``|\p{Lu})/u.test(lastSegment(ref.name)) && !seen.has(ref.name)) {
+        seen.add(ref.name);
+        addReference(ctx, ownerId, ref, 'references');
       }
     }
     for (const c of n.namedChildren) stack.push(c);
   }
+}
+
+/** Record `ref`, at the name it is written at, with the qualified names its receiver's type gives it. */
+function addReference(ctx: ExtractorContext, ownerId: string, ref: BareCall, kind: 'calls' | 'references' | 'instantiates'): void {
+  ctx.addUnresolvedReference({
+    fromNodeId: ownerId,
+    referenceName: ref.name,
+    referenceKind: kind,
+    line: ref.at.startPosition.row + 1,
+    column: ref.at.startPosition.column,
+    ...(ref.candidates ? { candidates: ref.candidates } : {}),
+  });
 }
 
 /**
@@ -551,27 +478,11 @@ function visitBody(ctx: ExtractorContext, body: SyntaxNode, ownerId: string): vo
     const n = stack.pop()!;
     if (n.type === 'infix_expression') {
       const piped = getPipeCallee(n, ctx.source);
-      if (piped) {
-        ctx.addUnresolvedReference({
-          fromNodeId: ownerId,
-          referenceName: piped.name,
-          referenceKind: 'calls',
-          line: piped.at.startPosition.row + 1,
-          column: piped.at.startPosition.column,
-        });
-      }
+      if (piped) addReference(ctx, ownerId, piped, 'calls');
     }
     // `{ Name = n; Email = e }` builds the record type those labels belong to; `{ c with Name = … }` one of `c`'s type.
     const record = n.type === 'brace_expression' ? recordConstruction(n, ctx.source) : null;
-    if (record) {
-      ctx.addUnresolvedReference({
-        fromNodeId: ownerId,
-        referenceName: record,
-        referenceKind: 'instantiates',
-        line: n.startPosition.row + 1,
-        column: n.startPosition.column,
-      });
-    }
+    if (record) addReference(ctx, ownerId, record, 'instantiates');
     // `:? Circle`, `c :> IShape`, `o :?> Circle`, `typeof<Circle>`: a type written in an expression is used there.
     if (n.type === 'type_check_pattern') {
       addTypeReferences(ctx, ownerId, n);
@@ -579,15 +490,7 @@ function visitBody(ctx: ExtractorContext, body: SyntaxNode, ownerId: string): vo
       for (const c of n.namedChildren) if (isTypeNode(c) || c.type === 'types') addTypeReferences(ctx, ownerId, c);
     }
     const value = valueName(n, ctx.source);
-    if (value) {
-      ctx.addUnresolvedReference({
-        fromNodeId: ownerId,
-        referenceName: value,
-        referenceKind: 'references',
-        line: n.startPosition.row + 1,
-        column: n.startPosition.column,
-      });
-    }
+    if (value) addReference(ctx, ownerId, value, 'references');
     // An object expression is a class of its own (`objectExpression`): what its members do is theirs.
     if (n.type === 'object_expression') continue;
     for (const c of n.namedChildren) stack.push(c);
@@ -610,15 +513,7 @@ function walkCalls(ctx: ExtractorContext, node: SyntaxNode, ownerId: string): vo
     return;
   }
   const callee = fsharpExtractor.extractBareCall?.(node, ctx.source);
-  if (callee) {
-    ctx.addUnresolvedReference({
-      fromNodeId: ownerId,
-      referenceName: callee,
-      referenceKind: 'calls',
-      line: node.startPosition.row + 1,
-      column: node.startPosition.column,
-    });
-  }
+  if (callee) addReference(ctx, ownerId, typeof callee === 'string' ? { name: callee, at: node } : callee, 'calls');
   for (const child of node.namedChildren) walkCalls(ctx, child, ownerId);
 }
 
@@ -634,15 +529,10 @@ function objectExpression(ctx: ExtractorContext, node: SyntaxNode, ownerId: stri
   if (!head) return;
   const constructed = head.type === 'application_expression' ? head.namedChild(0) : null;
   const typeNode = constructed ?? head;
-  const name = typeRefName(typeNode, ctx.source) ?? lastSegment(txt(typeNode, ctx.source).replace(/<.*$/, ''));
-  if (!name) return;
-  ctx.addUnresolvedReference({
-    fromNodeId: ownerId,
-    referenceName: name,
-    referenceKind: 'instantiates',
-    line: typeNode.startPosition.row + 1,
-    column: typeNode.startPosition.column,
-  });
+  const ref = typeReference(typeNode, ctx.source);
+  if (!ref) return;
+  const name = lastSegment(ref.name);
+  addReference(ctx, ownerId, ref, 'instantiates');
   // The base class's constructor arguments are evaluated where the object is built.
   if (constructed) for (const arg of head.namedChildren.slice(1)) visitBody(ctx, arg, ownerId);
   const anon = ctx.createNode('class', `<${name}$anon@${node.startPosition.row + 1}>`, node, {});
@@ -753,14 +643,23 @@ function handleMemberDefn(node: SyntaxNode, ctx: ExtractorContext): void {
     // type (when written) is the first type node before the first body expr.
     const children = inner.namedChildren;
     let retText: string | undefined;
+    let retNode: SyntaxNode | undefined;
     for (const c of children) {
       if (nameNode?.equals(c) || isArg(c)) continue;
       if (isTypeNode(c) && retText === undefined) {
         retText = txt(c, source);
+        retNode = c;
         continue;
       }
       break;
     }
+    // `member x.Go(a: int) : Result` reads as one typed pattern, `(a: int) : Result`, in the
+    // argument slot: its type is the result's, not an argument's.
+    const lastArg = argNodes[argNodes.length - 1];
+    if (!retNode && lastArg?.type === 'typed_pattern' && lastArg.namedChild(0)?.type !== 'identifier_pattern') {
+      retNode = lastArg.namedChildren.find((c, i) => i > 0 && isTypeNode(c));
+    }
+    const body = children.find((c) => !(nameNode?.equals(c) || isArg(c) || isTypeNode(c)));
 
     const keywords = leadingKeywords(source.slice(node.startIndex, inner.startIndex));
     const access = accessOf(node, source);
@@ -774,6 +673,8 @@ function handleMemberDefn(node: SyntaxNode, ctx: ExtractorContext): void {
     };
     if (access) extra.visibility = access;
     if (keywords.length > 0) extra.decorators = keywords;
+    const result = retNode ? typePath(retNode, source) : expressionType(body ?? null, source);
+    if (result) extra.returnType = result;
 
     const memberNode = ctx.createNode(kind, symbolName, node, extra);
     if (memberNode) {
@@ -809,6 +710,7 @@ function handleMemberDefn(node: SyntaxNode, ctx: ExtractorContext): void {
     const field = ctx.createNode('field', symbolName, node, {
       signature: typeNode ? txt(typeNode, source) : undefined,
       isExported: accessOf(node, source) !== 'private',
+      ...(typeNode && typePath(typeNode, source) ? { returnType: typePath(typeNode, source)! } : {}),
     });
     if (field && typeNode) addTypeReferences(ctx, field.id, typeNode);
   } else if (inner.type === 'property_or_ident') {
@@ -819,10 +721,13 @@ function handleMemberDefn(node: SyntaxNode, ctx: ExtractorContext): void {
     if (!symbolName) return;
     const keywords = leadingKeywords(source.slice(node.startIndex, inner.startIndex));
     const access = accessOf(node, source);
+    const annotation = node.namedChildren.find((c) => isTypeNode(c));
+    const result = annotation ? typePath(annotation, source) : expressionType(node.namedChildren.find((c, i) => i > 0 && !isTypeNode(c)) ?? null, source);
     const propNode = ctx.createNode('property', symbolName, node, {
       isStatic: keywords.includes('static') || undefined,
       isExported: access !== 'private',
       ...(access ? { visibility: access } : {}),
+      ...(result ? { returnType: result } : {}),
     });
     if (propNode) {
       ctx.pushScope(propNode.id);
@@ -840,9 +745,11 @@ function handleMemberDefn(node: SyntaxNode, ctx: ExtractorContext): void {
 
     const curried = childOfTypes(inner, 'curried_spec');
     let signature: string | undefined;
+    let abstractResult: string | null = null;
     if (curried) {
       const argsSpec = childOfTypes(curried, 'arguments_spec');
       const retNode = curried.namedChildren.find((c) => isTypeNode(c));
+      abstractResult = retNode ? typePath(retNode, source) : null;
       const argsText = argsSpec ? txt(argsSpec, source).replace(/^\(/, '').replace(/\)$/, '') : '';
       const retText = retNode ? txt(retNode, source) : undefined;
       if (argsText || retText) signature = `${argsText ? `(${argsText})` : '()'}${retText ? ` : ${retText}` : ''}`;
@@ -857,6 +764,7 @@ function handleMemberDefn(node: SyntaxNode, ctx: ExtractorContext): void {
       signature,
       isAbstract: true,
       isExported: true,
+      ...(abstractResult ? { returnType: abstractResult } : {}),
     });
     if (abstractNode && curried) addTypeReferences(ctx, abstractNode.id, curried);
   }
@@ -1001,6 +909,8 @@ function handleTypeDefn(
             const fieldTypeNode = c.namedChildren.find((cc) => isTypeNode(cc));
             const fieldExtra: Record<string, unknown> = {};
             if (fieldTypeNode) fieldExtra.signature = txt(fieldTypeNode, source);
+            const fieldType = fieldTypeNode ? typePath(fieldTypeNode, source) : null;
+            if (fieldType) fieldExtra.returnType = fieldType;
             const field = ctx.createNode('field', fieldName, c, fieldExtra);
             if (field && fieldTypeNode) addTypeReferences(ctx, field.id, fieldTypeNode);
           }
@@ -1149,6 +1059,13 @@ function handleBinding(
     if (initText) extra.signature = `= ${initText.slice(0, 100)}`;
   }
   if (decorators.length > 0) extra.decorators = decorators;
+  // What the binding evaluates to (a function: what a call of it returns): its annotation, else its body's value.
+  if (boundNames.length === 1) {
+    const annotation = rest.find((c) => isTypeNode(c));
+    const result = annotation ? typePath(annotation, source)
+      : expressionType(lambda ? lambda.namedChild(lambda.namedChildCount - 1) : body, source);
+    if (result) extra.returnType = result;
+  }
 
   // The first binding sits where its `let` does; the ones joined by `and` where their own name does.
   const anchor = first ? defn : left;

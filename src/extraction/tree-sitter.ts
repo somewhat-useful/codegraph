@@ -7647,16 +7647,18 @@ export class TreeSitterExtractor {
       } else if (this.language === 'kotlin' && nodeType === 'infix_expression') {
         this.extractKotlinInfixCall(node);
       } else if (this.extractor!.extractBareCall) {
-        const calleeName = this.extractor!.extractBareCall(node, this.source);
-        if (calleeName && this.nodeStack.length > 0) {
+        const bare = this.extractor!.extractBareCall(node, this.source);
+        const call = typeof bare === 'string' ? { name: bare, at: node } : bare;
+        if (call && call.name && this.nodeStack.length > 0) {
           const callerId = this.nodeStack[this.nodeStack.length - 1];
           if (callerId) {
             this.unresolvedReferences.push({
               fromNodeId: callerId,
-              referenceName: calleeName,
+              referenceName: call.name,
               referenceKind: 'calls',
-              line: node.startPosition.row + 1,
-              column: node.startPosition.column,
+              line: call.at.startPosition.row + 1,
+              column: call.at.startPosition.column,
+              ...('candidates' in call && call.candidates ? { candidates: call.candidates } : {}),
             });
           }
         }

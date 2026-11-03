@@ -1575,3 +1575,91 @@ namespace Web {
     expect(edgesOf('Web.cs', 'Run', ['calls', 'instantiates'], 'Plain')).toEqual(['calls:fsharp:Shop.Domain::Pricing::discount@5', 'instantiates:fsharp:Shop.Domain::Customer@2']);
   });
 });
+
+describe('F# names as the extractor writes them: the path, its position, and the type a binding gives a value', () => {
+  let dir = '';
+  let project: CodeGraph;
+
+  beforeAll(async () => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-fsharp-bindings-'));
+    const files: Record<string, string> = {
+      'Types.fs': `namespace Shop
+
+type Repo() =
+    member _.Save() = 1
+    member this.Add(x: int) : Repo = this
+
+type Cache() =
+    member _.Save() = 2
+
+module Settings =
+    let Current = Repo()
+`,
+      'Use.fs': `module Use
+
+open Shop
+
+module Calc =
+    let helper x = x
+
+let helper x = x + 1
+let make () = Repo()
+
+let shadowed (r: Cache) =
+    let r = Repo()
+    r.Save()
+let twoOnALine () = Calc.helper 1 + helper 2
+let viaFactory () =
+    let r = make ()
+    r.Save()
+let repo = Repo()
+let viaModuleValue () = repo.Save()
+let viaOtherFile () = Settings.Current.Save()
+let viaChain () = (Repo()).Add(1).Save()
+
+type Svc() as self =
+    let store = Cache()
+    member _.Go() = store.Save()
+    member _.Run() = self.Go()
+`,
+    };
+    for (const [rel, content] of Object.entries(files)) fs.writeFileSync(path.join(dir, rel), content);
+    project = await CodeGraph.init(dir, { index: true });
+  });
+
+  afterAll(() => {
+    project?.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  const callsOf = (name: string): string[] => {
+    const id = project.getNodesInFile('Use.fs').find((n) => n.name === name)!.id;
+    return project.getOutgoingEdgesFrom([id]).filter((e) => e.kind === 'calls').map((e) => project.getNode(e.target)!.qualifiedName).sort();
+  };
+
+  it('types a value by the nearest binding of its name: a `let` over a parameter wins', () => {
+    expect(callsOf('shadowed')).toEqual(['Shop::Repo::Save']);
+  });
+
+  it('reads each call of a line at its own name, with its own qualifier', () => {
+    expect(callsOf('twoOnALine')).toEqual(['Use::Calc::helper', 'Use::helper']);
+  });
+
+  it('types a value by what the function it is bound to returns', () => {
+    expect(callsOf('viaFactory')).toEqual(['Shop::Repo::Save', 'Use::make']);
+  });
+
+  it('types a module value, in this file or another, by what it is bound to', () => {
+    expect(callsOf('viaModuleValue')).toEqual(['Shop::Repo::Save']);
+    expect(callsOf('viaOtherFile')).toEqual(['Shop::Repo::Save']);
+  });
+
+  it('types a chain of calls by what each member returns', () => {
+    expect(callsOf('viaChain')).toEqual(['Shop::Repo::Add', 'Shop::Repo::Save']);
+  });
+
+  it('types a class `let` and the `as self` identifier', () => {
+    expect(callsOf('Go')).toEqual(['Shop::Cache::Save']);
+    expect(callsOf('Run')).toEqual(['Use::Svc::Go']);
+  });
+});
