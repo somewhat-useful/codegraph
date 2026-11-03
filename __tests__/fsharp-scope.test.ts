@@ -1312,3 +1312,65 @@ let useEarly () = Early.useUtil ()
     expect(callsOf('App/Early.fs', 'useLate')).toEqual([]);
   });
 });
+
+describe('F# signature files and union cases as .NET sees them', () => {
+  let dir = '';
+  let project: CodeGraph;
+
+  beforeAll(async () => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-fsharp-fsi-'));
+    const files: Record<string, string> = {
+      'Lib.fsi': `module Lib
+
+val shown : int -> int
+`,
+      'Lib.fs': `module Lib
+
+let shown x = x
+let hidden x = x
+`,
+      'Use.fs': `module Use
+
+let a () = Lib.shown 1
+let b () = Lib.hidden 1
+`,
+      'Shapes.fs': `namespace Geo
+
+type Shape =
+    | Circle of float
+    | Empty
+`,
+      'Draw.cs': `using Geo;
+
+public class Draw
+{
+    public object Make() { return Shape.NewCircle(1.0); }
+    public object None() { return Shape.Empty; }
+}
+`,
+    };
+    for (const [rel, content] of Object.entries(files)) fs.writeFileSync(path.join(dir, rel), content);
+    project = await CodeGraph.init(dir, { index: true });
+  });
+
+  afterAll(() => {
+    project?.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  const edgesOf = (file: string, name: string, kinds: string[]): string[] => {
+    const id = project.getNodesInFile(file).find((n) => n.name === name)!.id;
+    return project.getOutgoingEdgesFrom([id]).filter((e) => kinds.includes(e.kind)).map((e) => project.getNode(e.target)!.qualifiedName);
+  };
+
+  it('links from another file only what the signature file declares', () => {
+    expect(edgesOf('Use.fs', 'a', ['calls'])).toEqual(['Lib::shown']);
+    expect(edgesOf('Use.fs', 'b', ['calls'])).toEqual([]);
+  });
+
+  it('links C#\'s `Shape.NewCircle(...)` to the union\'s case, and `Shape.Empty` to the union', () => {
+    expect(edgesOf('Draw.cs', 'Make', ['calls'])).toEqual(['Geo::Shape::Circle']);
+    // A static member read records its type alone in C# (`Color.Red` of a C# enum too): the union type.
+    expect(edgesOf('Draw.cs', 'None', ['calls', 'references'])).toEqual(['Geo::Shape']);
+  });
+});

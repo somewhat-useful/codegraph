@@ -728,15 +728,18 @@ export function isFsharpCompiledName(name: string, context: ResolutionContext): 
   return compiledNamed(name, context).length > 0;
 }
 
-/** F# declarations whose `[<CompiledName>]` is `name`, which a lookup by their F# name does not find. */
+/**
+ * F# declarations .NET names `name` where F# does not — a `[<CompiledName>]`, a
+ * union case's `New<Case>` — which a lookup by their F# name does not find.
+ */
 function compiledNamed(name: string, context: ResolutionContext): Node[] {
   let byName = COMPILED_NAMES.get(context);
   if (!byName) {
     byName = new Map();
-    for (const kind of ['function', 'method', 'property', 'variable', 'constant'] as const) {
+    for (const kind of ['function', 'method', 'property', 'variable', 'constant', 'enum_member'] as const) {
       for (const n of context.getNodesByKind(kind)) {
         if (n.language !== 'fsharp') continue;
-        const compiled = compiledNameOf(n);
+        const compiled = compiledNameOf(n) ?? (n.kind === 'enum_member' && n.signature ? `New${n.name}` : null);
         if (compiled !== null && compiled.toLowerCase() !== n.name.toLowerCase()) {
           byName.set(compiled, [...(byName.get(compiled) ?? []), n]);
         }
@@ -786,12 +789,25 @@ function dotnetTargetOf(candidate: Node, context: ResolutionContext): DotnetTarg
     reachable: !(segments.length === 0 && /\.fsx$/i.test(candidate.filePath)),
     namespace: ns,
     container: holders.length > 0 ? joinPath(ns, holders.join('.')) : ns,
-    name: compiledNameOf(candidate) ?? (candidate.kind === 'module' && hasModuleSuffix(candidate, nodes) ? `${candidate.name}Module` : candidate.name),
+    name: compiledNameOf(candidate) ?? unionCaseDotnetName(candidate, nodes) ??
+      (candidate.kind === 'module' && hasModuleSuffix(candidate, nodes) ? `${candidate.name}Module` : candidate.name),
     kind: candidate.kind,
     isStatic: !MEMBER_KINDS.has(candidate.kind) || candidate.isStatic === true,
   };
   perContext.set(candidate.id, target);
   return target;
+}
+
+/**
+ * A union case as .NET sees it: a case with fields is built by the union type's
+ * static method `New<Case>` (`Shape.NewCircle(r)`), a case without one is the
+ * static property of its own name (`Shape.Empty`). Null for anything else.
+ */
+function unionCaseDotnetName(candidate: Node, nodesInFile: readonly Node[]): string | null {
+  if (candidate.kind !== 'enum_member') return null;
+  const owner = candidate.qualifiedName.slice(0, candidate.qualifiedName.lastIndexOf('::'));
+  if (!nodesInFile.some((n) => n.qualifiedName === owner && n.kind === 'union')) return null;
+  return candidate.signature ? `New${candidate.name}` : candidate.name;
 }
 
 /**
@@ -827,6 +843,7 @@ export function clearFsharpScopeCaches(context: ResolutionContext): void {
   DOTNET_TARGETS.delete(context);
   EXTENSIONS.delete(context);
   COMPILE_ORDERS.delete(context);
+  SIGNATURES.delete(context);
   COMPILED_NAMES.delete(context);
   FILE_SCOPES.delete(context);
   DECLARED_NAMESPACES.delete(context);
@@ -893,7 +910,8 @@ export function matchDotnetNameInFsharp(ref: UnresolvedRef, context: ResolutionC
   const named = context.getNodesByLowerName(name.toLowerCase());
   const allowed = DOTNET_TARGET_KINDS[ref.referenceKind];
   const declared = [...named, ...compiledNamed(name, context)]
-    .filter((n) => n.language === 'fsharp' && !NON_SYMBOL_KINDS.has(n.kind) && !isTypeExtension(n) && (!allowed || allowed.has(n.kind)));
+    .filter((n) => n.language === 'fsharp' && !NON_SYMBOL_KINDS.has(n.kind) && !isTypeExtension(n) && (!allowed || allowed.has(n.kind)) &&
+      !isHiddenBySignature(n, context));
   if (declared.length === 0) return null;
   const file = dotnetFileScopeOf(ref, context, read);
   if (!file) return null;
@@ -1051,6 +1069,32 @@ function isCompiledLater(candidate: Node, ref: UnresolvedRef, context: Resolutio
   return at !== undefined && candidateAt !== undefined && candidateAt > at;
 }
 
+const SIGNATURES = new WeakMap<ResolutionContext, Map<string, string | null>>();
+
+/**
+ * Whether a signature file hides `candidate` from other files: beside `X.fs`,
+ * an `X.fsi` declares what the file shows, and what it leaves out is private to
+ * the file. The signature is read as text (the grammar cannot parse one), so a
+ * name it mentions anywhere counts as declared.
+ */
+function isHiddenBySignature(candidate: Node, context: ResolutionContext): boolean {
+  if (!/\.fs$/i.test(candidate.filePath)) return false;
+  let byFile = SIGNATURES.get(context);
+  if (!byFile) SIGNATURES.set(context, (byFile = new Map()));
+  const signaturePath = `${candidate.filePath}i`;
+  let text = byFile.get(signaturePath);
+  if (text === undefined) {
+    try {
+      text = fs.readFileSync(path.join(context.getProjectRoot(), signaturePath), 'utf8');
+    } catch {
+      text = null;
+    }
+    byFile.set(signaturePath, text);
+  }
+  if (text === null) return false;
+  return indexOfWord(text, candidate.name.replace(/^``|``$/g, ''), 0) < 0;
+}
+
 /** Is `candidate` something `ref` can mean? Always true for refs and candidates F# has nothing to say about. */
 export function isFsharpCandidateInScope(
   candidate: Node,
@@ -1064,6 +1108,8 @@ export function isFsharpCandidateInScope(
     if (ref.language === 'razor') return false;
     if (!DOTNET_REFERRERS.has(ref.language)) return true;
     if (!SYMBOL_REFERENCE_KINDS.has(ref.referenceKind) || NON_SYMBOL_KINDS.has(candidate.kind)) return true;
+    // What a signature file leaves out is private to its F# file.
+    if (isHiddenBySignature(candidate, context)) return false;
     const target = dotnetTargetOf(candidate, context);
     // An instance member on a value is the value's type's: that is the C# or VB.NET
     // resolver's to know (`var o = new Order(…); o.Confirm()`), not the written name's.
@@ -1079,8 +1125,10 @@ export function isFsharpCandidateInScope(
   if (ref.referenceKind === 'calls' && candidate.kind === 'module') return false;
   // `type System.String with …` adds members; it declares no type a name could mean.
   if (isTypeExtension(candidate)) return false;
-  // A file sees only what the files compiled before it declare.
+  // A file sees only what the files compiled before it declare, and of a file with a
+  // signature, only what the signature declares.
   if (candidate.language === 'fsharp' && isCompiledLater(candidate, ref, context)) return false;
+  if (candidate.language === 'fsharp' && candidate.filePath !== ref.filePath && isHiddenBySignature(candidate, context)) return false;
 
   const sameFile = candidate.filePath === ref.filePath;
   const refScope = scopeOfRef(ref, context);

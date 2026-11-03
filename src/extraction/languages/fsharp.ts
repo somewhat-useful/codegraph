@@ -945,7 +945,9 @@ function handleTypeDefn(
           const caseNameNode = c.namedChildren.find((cc) => NAME_NODES.has(cc.type));
           const caseName = caseNameNode ? txt(caseNameNode, source) : '';
           if (caseName) {
-            const member = ctx.createNode('enum_member', caseName, c, { isExported: true });
+            // `Circle of float` carries fields (its signature is them); `Empty` carries none.
+            const fields = c.type === 'union_type_case' ? txt(c, source).slice((caseNameNode!.endIndex - c.startIndex)).trim().replace(/^of\s+/, '') : '';
+            const member = ctx.createNode('enum_member', caseName, c, { isExported: true, ...(fields ? { signature: fields.slice(0, 100) } : {}) });
             if (member) addTypeReferences(ctx, member.id, c);
           }
         }
