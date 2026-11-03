@@ -1337,11 +1337,11 @@ export class CodeGraph {
             for (const language of moduleConfigLanguages(changed.filter((rel) => !/\.fsi$/i.test(rel)))) {
               reopened += this.orchestrator.resurrectResolutionEdgesForLanguage(language);
             }
-            for (const signature of signatures) {
-              const implementation = signature.slice(0, -1);
-              const declared = [...new Set(this.queries.getNodesByFile(implementation).map((n) => n.name))];
+            if (signatures.length > 0) {
+              const implementations = signatures.map((signature) => signature.slice(0, -1));
+              const declared = [...new Set(implementations.flatMap((file) => this.queries.getNodesByFile(file).map((n) => n.name)))];
               for (const language of ['fsharp', 'csharp'] as const) {
-                reopened += this.orchestrator.resurrectResolutionEdgesTouching(language, { targetFiles: [implementation], sourceDirs: [], moduleLeaves: declared }).length;
+                reopened += this.orchestrator.resurrectResolutionEdgesTouching(language, { targetFiles: implementations, sourceDirs: [], moduleLeaves: declared }).length;
               }
             }
             refreshSynthesis = true;

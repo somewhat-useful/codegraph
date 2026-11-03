@@ -1072,6 +1072,8 @@ export class ReferenceResolver {
         return this.queries.getAllFilePaths();
       },
 
+      getFilePathsOfLanguage: (language) => this.queries.getFilePathsOfLanguage(language),
+
       listDirectories: (relativePath: string) => {
         const target = relativePath === '.' || relativePath === ''
           ? this.projectRoot

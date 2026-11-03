@@ -17,10 +17,12 @@ Branch `fsharp-support-wip` (work in progress). `fsharp-support` = last pushed r
 
 6. **Done:** detector — a C block comment (`/*`, F# starts no line with `/`) and GLSL vector/matrix constructors (`vec4(`, `mat3(`) are GLSL signals (`grammars.ts`, doc updated, tests in `fsharp-detection.test.ts`).
 
+7. **Done:** sync cost — `.fsi` re-open batched into one pass per language (`src/index.ts`); F# files found by `getFilePathsOfLanguage` (new optional `ResolutionContext` method, `queries.getFilePathsOfLanguage`, files.language index) instead of reading every file node.
+
 ## Not verified yet
 - Timing after the cached-bindings rewrite (before it: Paket 6.7s → 10s; the rewrite targets the remaining extractor cost). Run: `npm run build`, then index FSharp.Data / Giraffe / Paket.
 - Full `npm test` after this step (only `glyphs.test.ts` fails, also on upstream).
 
 ## Remaining (from last review)
-- Sync cost: file-node scan per sync (`fsharpConfigFiles`), `.fsi` entries never removed, shader `.fs` re-read every sync, `.fsi` reopen batching.
+- Sync cost left: shader `.fs` re-read every sync (idea: remember a rejected file's size+mtime in metadata, skip reading when unchanged — sync loop in `src/extraction/index.ts` ~line 4030), absent `.fsi` entries never dropped from the module-config snapshot.
 - Then one full review. Rule from the user: fix only as general cases, never special cases.

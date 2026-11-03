@@ -514,6 +514,7 @@ export class QueryBuilder {
     getUnresolvedDependentsAfter?: SqliteStatement;
     deleteRefsByRowIdsFull?: SqliteStatement;
     getAllFilePaths?: SqliteStatement;
+    getFilePathsOfLanguage?: SqliteStatement;
     getAllNodeNames?: SqliteStatement;
     getCppIncludeNodes?: SqliteStatement;
     getDominantFile?: SqliteStatement;
@@ -4553,6 +4554,14 @@ export class QueryBuilder {
   /**
    * Get all tracked file paths (lightweight — no full FileRecord objects)
    */
+  /** The paths of the files indexed as `language`. */
+  getFilePathsOfLanguage(language: Language): string[] {
+    if (!this.stmts.getFilePathsOfLanguage) {
+      this.stmts.getFilePathsOfLanguage = this.db.prepare('SELECT path FROM files WHERE language = ? ORDER BY path');
+    }
+    return (this.stmts.getFilePathsOfLanguage.all(language) as Array<{ path: string }>).map((r) => r.path);
+  }
+
   getAllFilePaths(): string[] {
     if (!this.stmts.getAllFilePaths) {
       this.stmts.getAllFilePaths = this.db.prepare('SELECT path FROM files ORDER BY path');

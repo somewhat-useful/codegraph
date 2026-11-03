@@ -211,7 +211,7 @@ function fsharpFiles(context: ResolutionContext): string[] {
 }
 
 function indexedFsharpFiles(context: ResolutionContext): string[] {
-  return context.getNodesByKind('file').filter((n) => n.language === 'fsharp').map((n) => n.filePath);
+  return context.getFilePathsOfLanguage?.('fsharp') ?? context.getNodesByKind('file').filter((n) => n.language === 'fsharp').map((n) => n.filePath);
 }
 
 /** Whether the project has F# code at all. */
