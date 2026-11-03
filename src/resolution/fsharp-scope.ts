@@ -52,21 +52,6 @@ const NON_SYMBOL_KINDS: ReadonlySet<string> = new Set(['file', 'namespace', 'imp
 /** What a type owns: reached through a value or a type name, never bare. */
 const MEMBER_KINDS: ReadonlySet<string> = new Set(['method', 'property', 'field']);
 
-/**
- * Members every .NET object has. A project's override of one is not what
- * `x.ToString()` means on a value whose type is not known: the call stays unresolved.
- */
-const UNIVERSAL_MEMBERS: ReadonlySet<string> = new Set([
-  'ToString',
-  'Equals',
-  'GetHashCode',
-  'GetType',
-  'CompareTo',
-  'Dispose',
-  'Finalize',
-  'MemberwiseClone',
-]);
-
 /** Languages an F# name can be written against: its own and the other .NET ones. */
 const SCOPED_LANGUAGES: ReadonlySet<string> = new Set(['fsharp', 'csharp', 'vbnet']);
 
@@ -94,6 +79,14 @@ export interface FsharpRefScope {
   qualifiers: readonly string[];
   /** The name is written through a capitalised path whose head the project does not declare: `System.Threading.Tasks.Task.Run`. */
   externalQualifier: boolean;
+  /**
+   * When the name is a member written on a value (`r.Add`, `this.Step`,
+   * `Settings.Current.Save`): the dotted paths of the value's type and of the
+   * types it inherits or implements, as F# types it — a self identifier, a
+   * parameter's annotation, a `let` or `use` bound to a constructor or
+   * annotated. Null when that type is not known: then no member is meant.
+   */
+  receivers?: readonly string[] | null;
 }
 
 /** Where a candidate is declared. */
@@ -193,17 +186,10 @@ export function isFsharpCandidateReachable(ref: FsharpRefScope, candidate: Fshar
   }
   if (ref.externalQualifier) return false;
 
-  // A value, or a chain of properties from a name (`Settings.Current.Save`), has some type's member:
-  // reached by name, near what the file can see.
+  // A member on a value (`r.Add`), or on a chain of properties from a name (`Settings.Current.Save`),
+  // is a member of the value's type, as F# types the value: its type, or one that type inherits.
   const viaValue = ref.qualifiers.some((q) => !namesContainer(q) || q.includes('.'));
-  if (viaValue && isMember) {
-    if (UNIVERSAL_MEMBERS.has(candidate.name)) return false;
-    if (ref.namespace !== '' && ref.namespace === candidate.namespace) return true;
-    if (ref.container !== '' && (isPathPrefix(c, ref.container) || isPathPrefix(ref.container, c))) return true;
-    // An open reaches its own members and those of a type or module directly under it. The
-    // opens are full paths (joined to the scopes around the reference), so `open Core` is never `Vendor.Core`.
-    return opens.has(c) || opens.has(parentPath(c));
-  }
+  if (viaValue && isMember) return ref.receivers?.includes(c) === true;
 
   if (ref.qualifiers.length > 0) return false;
 
@@ -502,7 +488,95 @@ function scopeOfRef(ref: UnresolvedRef, context: ResolutionContext): FsharpRefSc
     externalQualifier: qualifiers.length > 0 && qualifiers.every((q) => isExternalPath(q, context)),
   };
   REF_SCOPES.set(ref, scope);
+  const onValue = qualifiers.find((q) => q !== '_' && (!namesContainer(q) || q.includes('.')));
+  if (onValue !== undefined) scope.receivers = receiversOf(onValue, ref, from, scope, context);
   return scope;
+}
+
+/** A type written in an annotation or a construction, without its generic arguments: `Repo<int>` → `Repo`. */
+const TYPE_NAME = String.raw`([A-Za-z_\x60][\w.\x60']*)`;
+
+/**
+ * The type of the value `written` names at `ref`, as F# types it, with what it
+ * inherits: the dotted paths of those types, or null when F# would know it and
+ * the source does not say. Read from what the source states — never from the
+ * name of the member the value is used with.
+ */
+function receiversOf(written: string, ref: UnresolvedRef, from: Node | undefined, scope: FsharpRefScope, context: ResolutionContext): string[] | null {
+  const typeName = written.includes('.') ? pathValueType(written, scope, context) : localValueType(written, ref, from, context);
+  if (typeName === null) return null;
+  const types = typeName.kind === 'path' ? [typeName.path] : reachableTypes(typeName.name, scope, context);
+  if (types.length === 0) return null;
+  const paths = new Set<string>();
+  const visit = (node: Node, depth: number): void => {
+    const path = node.qualifiedName.split('::').join('.');
+    if (paths.has(path) || depth > 8) return;
+    paths.add(path);
+    for (const parent of context.getSupertypeNodes?.(node.id) ?? []) visit(parent, depth + 1);
+  };
+  for (const type of types) {
+    if (typeof type === 'string') paths.add(type);
+    else visit(type, 0);
+  }
+  return [...paths];
+}
+
+type ValueType = { kind: 'name'; name: string } | { kind: 'path'; path: string };
+
+/** The type a bare value name has where `ref` is written: a self identifier, a parameter, a local or a module value. */
+function localValueType(name: string, ref: UnresolvedRef, from: Node | undefined, context: ResolutionContext): ValueType | null {
+  const lines = context.getFileLines?.(ref.filePath) ?? context.readFile(ref.filePath)?.split(/\r?\n/) ?? [];
+  const word = escapeRegExp(name);
+  if (from && from.kind !== 'file') {
+    // `member x.Run() = x.Step()`: the self identifier is the type the member is declared in.
+    const head = lines.slice(from.startLine - 1, from.startLine + 1).join(' ');
+    const self = new RegExp(String.raw`\bmember\s+(?:(?:private|internal|public|static|inline)\s+)*${word}\s*\.`).test(head) ||
+      new RegExp(String.raw`\b(?:override|default)\s+${word}\s*\.`).test(head);
+    if (self && MEMBER_KINDS.has(from.kind)) return { kind: 'path', path: containerOfNode(from) };
+    // `(r: Repo)`: a parameter's annotation.
+    const parameter = new RegExp(String.raw`(?:^|[\s(,])${word}\s*:\s*${TYPE_NAME}`).exec(from.signature ?? '');
+    if (parameter) return { kind: 'name', name: parameter[1]! };
+    // The nearest `let` or `use` of the name above the reference, in the symbol's body.
+    const bound = new RegExp(String.raw`\b(?:let|use)!?\s+(?:mutable\s+)?${word}\s*(?::\s*${TYPE_NAME}[^=]*)?=\s*(?:new\s+)?${TYPE_NAME}?\s*(?:<[^>\n]*>)?\s*(\()?`);
+    for (let line = ref.line; line >= from.startLine; line--) {
+      const m = bound.exec(lines[line - 1] ?? '');
+      if (!m) continue;
+      if (m[1]) return { kind: 'name', name: m[1] };
+      return m[2] && m[3] && /^(?:\p{Lu}|\x60)/u.test(lastSegmentOf(m[2])) ? { kind: 'name', name: m[2] } : null;
+    }
+  }
+  return null;
+}
+
+/** The type of a module value written by its path (`Settings.Current`): what its initializer constructs. */
+function pathValueType(path: string, scope: FsharpRefScope, context: ResolutionContext): ValueType | null {
+  const name = lastSegmentOf(path);
+  const owner = path.slice(0, path.length - name.length - 1);
+  const values = context.getNodesByName(name).filter((n) =>
+    n.language === 'fsharp' && (n.kind === 'variable' || n.kind === 'constant') &&
+    (containerOfNode(n) === owner || containerOfNode(n).endsWith(`.${owner}`)) &&
+    isFsharpCandidateReachable({ ...scope, qualifiers: [owner], receivers: null }, scopeOfCandidate(n, context)));
+  if (values.length !== 1) return null;
+  const constructed = new RegExp(String.raw`^=\s*(?:new\s+)?${TYPE_NAME}\s*(?:<[^>]*>)?\s*\(`).exec(values[0]!.signature ?? '');
+  return constructed && /^(?:\p{Lu}|\x60)/u.test(lastSegmentOf(constructed[1]!)) ? { kind: 'name', name: constructed[1]! } : null;
+}
+
+/** The project types a type name written at a reference can mean, by F#'s scope rules for that reference. */
+function reachableTypes(written: string, scope: FsharpRefScope, context: ResolutionContext): Node[] {
+  const name = lastSegmentOf(written);
+  const qualifier = written.length > name.length ? written.slice(0, written.length - name.length - 1) : '';
+  const local = { ...scope, qualifiers: qualifier === '' ? [] : [qualifier], receivers: null };
+  return context.getNodesByName(name).filter((n) =>
+    SCOPED_LANGUAGES.has(n.language) && TYPE_KINDS.has(n.kind) && n.kind !== 'module' &&
+    (n.language !== 'fsharp' || isFsharpCandidateReachable(local, scopeOfCandidate(n, context))));
+}
+
+function lastSegmentOf(path: string): string {
+  return path.slice(path.lastIndexOf('.') + 1);
+}
+
+function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
 /**
@@ -758,8 +832,6 @@ export function isFsharpCandidateInScope(
 
   const sameFile = candidate.filePath === ref.filePath;
   const refScope = scopeOfRef(ref, context);
-  // Through a value, a member of this very file is not scoped by anything but its type.
-  if (sameFile && refScope.qualifiers.length > 0 && !refScope.qualifiers.some(namesContainer)) return true;
 
   const scope = scopeOfCandidate(candidate, context);
   // A C# or VB.NET declaration outside every namespace is global.

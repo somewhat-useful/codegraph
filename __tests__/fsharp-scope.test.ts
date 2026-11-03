@@ -64,15 +64,15 @@ describe('isFsharpCandidateReachable', () => {
     expect(isFsharpCandidateReachable(ref({ opens: ['Other.Lib'] }), candidate('Other.Lib.Fn'))).toBe(false);
   });
 
-  it('reaches a member through a value from what an open names as a prefix, never from the middle of a path', () => {
-    const save = (container: string): FsharpCandidateScope => candidate(container, { name: 'Save', kind: 'method', namespace: 'Vendor.Core' });
-    const viaValue = ref({ container: 'App.Main', namespace: 'App', opens: ['Core'], qualifiers: ['repo'] });
-    // `open Core` in `App.Main` names `Core` or `App.Core`: never `Vendor.Core`.
-    expect(isFsharpCandidateReachable(viaValue, save('Vendor.Core.Repo'))).toBe(false);
-    expect(isFsharpCandidateReachable(viaValue, save('App.Core.Repo'))).toBe(true);
-    expect(isFsharpCandidateReachable(viaValue, save('Core.Repo'))).toBe(true);
-    // A type directly under the opened scope, not one further down.
-    expect(isFsharpCandidateReachable(viaValue, save('Core.Data.Repo'))).toBe(false);
+  it('reaches a member through a value only on the value\'s type or a type it inherits', () => {
+    const save = (container: string): FsharpCandidateScope => candidate(container, { name: 'Save', kind: 'method', namespace: 'Shop.Core' });
+    const typed = ref({ qualifiers: ['repo'], receivers: ['Shop.Core.Repo', 'Shop.Core.RepoBase'] });
+    expect(isFsharpCandidateReachable(typed, save('Shop.Core.Repo'))).toBe(true);
+    expect(isFsharpCandidateReachable(typed, save('Shop.Core.RepoBase'))).toBe(true);
+    // Another type with a member of that name, in the same namespace: not the value's type.
+    expect(isFsharpCandidateReachable(typed, save('Shop.Core.Cache'))).toBe(false);
+    // A value whose type the source does not state names no member.
+    expect(isFsharpCandidateReachable(ref({ qualifiers: ['repo'], receivers: null }), save('Shop.Core.Repo'))).toBe(false);
   });
 
   it('reads an open relative to the scope it is written in', () => {
@@ -109,8 +109,8 @@ describe('isFsharpCandidateReachable', () => {
   it('never reaches anything through a path the project does not declare', () => {
     // `System.Threading.Tasks.Task.Run`: not the `Run` of a project type that happens to be opened.
     const run = candidate('Ts.Runner', { kind: 'method', namespace: 'Ts', name: 'Run' });
-    expect(isFsharpCandidateReachable(ref({ opens: ['Ts'], qualifiers: ['System.Threading.Tasks.Task'] }), run)).toBe(true);
     expect(isFsharpCandidateReachable(ref({ opens: ['Ts'], qualifiers: ['System.Threading.Tasks.Task'], externalQualifier: true }), run)).toBe(false);
+    expect(isFsharpCandidateReachable(ref({ opens: ['Ts'], qualifiers: ['System.Threading.Tasks.Task'], receivers: null }), run)).toBe(false);
   });
 
   it('never reaches a type member bare', () => {
@@ -131,11 +131,12 @@ describe('isFsharpCandidateReachable', () => {
     expect(isFsharpCandidateReachable(ref({ qualifiers: ['Lib.Fn.Inner'] }), inner)).toBe(false);
   });
 
-  it('reaches a member through a chain of properties, but not the members every object has', () => {
+  it('reaches a member through a chain of properties by the type of the value it ends at', () => {
     const save = candidate('Shop.Core.Cfg', { kind: 'method', namespace: 'Shop.Core', name: 'Save' });
-    expect(isFsharpCandidateReachable(ref({ qualifiers: ['Settings.Current'] }), save)).toBe(true);
-    expect(isFsharpCandidateReachable(ref({ qualifiers: ['x'] }), { ...save, name: 'ToString' })).toBe(false);
-    expect(isFsharpCandidateReachable(ref({ qualifiers: ['x'] }), { ...save, name: 'Add' })).toBe(true);
+    expect(isFsharpCandidateReachable(ref({ qualifiers: ['Settings.Current'], receivers: ['Shop.Core.Cfg'] }), save)).toBe(true);
+    expect(isFsharpCandidateReachable(ref({ qualifiers: ['Settings.Current'], receivers: null }), save)).toBe(false);
+    // A type's own `ToString` override is what `ToString` means on a value of that type.
+    expect(isFsharpCandidateReachable(ref({ qualifiers: ['x'], receivers: ['Shop.Core.Cfg'] }), { ...save, name: 'ToString' })).toBe(true);
   });
 
   it('reaches a container written through an `[<AutoOpen>]` module of an opened namespace', () => {
@@ -144,16 +145,9 @@ describe('isFsharpCandidateReachable', () => {
     expect(isFsharpCandidateReachable(ref({ opens: ['Core'], qualifiers: ['AgentName'] }), candidate('Core.Domain.AgentName'))).toBe(false);
   });
 
-  it('reaches a type member through a value only near what the file can see', () => {
-    const add = (container: string, namespace: string) => candidate(container, { kind: 'method', namespace });
-    expect(isFsharpCandidateReachable(ref({ qualifiers: ['x'] }), add('Shop.Core.Order', 'Shop.Core'))).toBe(true);
-    expect(isFsharpCandidateReachable(ref({ qualifiers: ['x'] }), add('Other.Lib.Order', 'Other.Lib'))).toBe(false);
-    expect(isFsharpCandidateReachable(ref({ qualifiers: ['x'], opens: ['Other.Lib'] }), add('Other.Lib.Order', 'Other.Lib'))).toBe(true);
-    // An open reaches the types directly under it, not those further down; the scopes around the reference are near.
-    expect(isFsharpCandidateReachable(ref({ qualifiers: ['x'], opens: ['Other'] }), add('Other.Lib.Order', 'Other.Lib'))).toBe(false);
-    expect(isFsharpCandidateReachable(ref({ qualifiers: ['x'] }), add('Shop.Core.Use.Inner', ''))).toBe(true);
-    // A function is not reached through a value.
-    expect(isFsharpCandidateReachable(ref({ qualifiers: ['x'] }), candidate('Shop.Core.Calc', { namespace: 'Shop.Core' }))).toBe(false);
+  it('reaches nothing but a member through a value', () => {
+    // A function is not reached through a value, whatever the value's type.
+    expect(isFsharpCandidateReachable(ref({ qualifiers: ['x'], receivers: ['Shop.Core.Calc'] }), candidate('Shop.Core.Calc', { namespace: 'Shop.Core' }))).toBe(false);
   });
 
   it('reaches `namespace global` from everywhere and the top of a script from nowhere else', () => {
@@ -969,5 +963,71 @@ End Namespace
     const discountNode = project.getNodesInFile('Domain/Pricing.fs').find((n) => n.name === 'discount')!;
     const callers = project.getCallers(discountNode.id).map((c) => c.node.filePath).sort();
     expect(callers).toEqual(['Vb/Nested.vb', 'Vb/Report.vb', 'Web/Controller.cs', 'Web/Controller.cs', 'Web/Controller.cs']);
+  });
+});
+
+describe('F# members on a value, by the value\'s type', () => {
+  let dir = '';
+  let project: CodeGraph;
+
+  beforeAll(async () => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-fsharp-receivers-'));
+    const files: Record<string, string> = {
+      'T.fs': `namespace Shop
+
+type RepoBase() =
+    member _.Save() = 0
+
+type Repo() =
+    inherit RepoBase()
+    member _.Add(x: int) = ()
+    member this.Twice(x: int) = this.Add(x); this.Add(x)
+
+type Cache() =
+    member _.Add(x: int) = ()
+    member _.Save() = 1
+`,
+      'U.fs': `module U
+
+open Shop
+
+let onForeign () =
+    let xs = ResizeArray<int>()
+    xs.Add(1)
+let onTyped (r: Repo) = r.Add(1)
+let onLocal () =
+    let c = Cache()
+    c.Add(2)
+let inherited (r: Repo) = r.Save()
+let unknown r = r.Add(3)
+`,
+    };
+    for (const [rel, content] of Object.entries(files)) fs.writeFileSync(path.join(dir, rel), content);
+    project = await CodeGraph.init(dir, { index: true });
+  });
+
+  afterAll(() => {
+    project?.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  const callsOf = (file: string, name: string): string[] => {
+    const id = project.getNodesInFile(file).find((n) => n.name === name)!.id;
+    return project.getOutgoingEdgesFrom([id]).filter((e) => e.kind === 'calls').map((e) => project.getNode(e.target)!.qualifiedName);
+  };
+
+  it('links a member on a value to the member of the value\'s own type', () => {
+    expect(callsOf('U.fs', 'onTyped')).toEqual(['Shop::Repo::Add']);
+    expect(callsOf('U.fs', 'onLocal')).toEqual(['Shop::Cache::Add']);
+    expect(callsOf('T.fs', 'Twice')).toEqual(['Shop::Repo::Add', 'Shop::Repo::Add']);
+  });
+
+  it('links a member the value\'s type inherits', () => {
+    expect(callsOf('U.fs', 'inherited')).toEqual(['Shop::RepoBase::Save']);
+  });
+
+  it('links nothing for a value of a type outside the project, or one the source does not state', () => {
+    expect(callsOf('U.fs', 'onForeign')).toEqual([]);
+    expect(callsOf('U.fs', 'unknown')).toEqual([]);
   });
 });
