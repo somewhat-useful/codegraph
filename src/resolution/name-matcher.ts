@@ -28,7 +28,7 @@ import { leavesWorkspaceRoot } from './workspace-packages';
 import { isMinifiedContent } from '../extraction/generated-detection';
 import { getCargoWorkspaceCrateMap, parsePackageName, parseTargetPaths, parseWorkspaceMembers } from './frameworks/cargo-workspace';
 import { blankRustCode, readRustScopes, rustBindingAt, rustInnerBlockAt, rustBoundsOf, rustFnAt, rustImplAt, splitRustTopLevel, type RustBinding, type RustPatternSite, type RustScopes } from './rust-scopes';
-import { isFsharpCandidateInScope, clearFsharpScopeCaches, matchDotnetNameInFsharp, type DotnetFileScope } from './fsharp-scope';
+import { isFsharpCandidateInScope, clearFsharpScopeCaches, latestFsharpBindings, matchDotnetNameInFsharp, type DotnetFileScope } from './fsharp-scope';
 /**
  * Ceiling on how many same-named definitions a FUZZY name-match strategy will
  * score. A name defined more times than this is "ubiquitous" — a method/symbol
@@ -14578,7 +14578,10 @@ export function matchByExactName(
     : swiftShape && swiftShape.shape !== 'chained' ? nearestSwiftMembers(filtered, ref, context)
     : kotlinBare ? lexicalKotlinMembers(filtered, ref, context)
     : rubyBare ? rubyMethodsOfCallerKind(filtered, ref, context)
-    : objcDeclaredType ? objcTypeDeclarations(filtered, ref) : cppSpecializationPool(filtered, ref, context);
+    : objcDeclaredType ? objcTypeDeclarations(filtered, ref)
+    // An F# name means what became visible last: of two opened `pick`s, the later `open`'s.
+    : ref.language === 'fsharp' ? latestFsharpBindings(filtered, ref, context)
+    : cppSpecializationPool(filtered, ref, context);
   // (Above the ceiling below nothing is picked, so no translation unit is read.)
   const candidates = ranked.length <= AMBIGUOUS_NAME_CEILING ? withinCppTranslationUnit(ranked, ref, context, true) : ranked;
 

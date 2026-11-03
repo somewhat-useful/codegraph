@@ -102,6 +102,9 @@ function leadingKeywords(prefix: string): string[] {
 /** Pipes: `x |> f 1` is extracted from the infix itself, so an application over it is not a second call. */
 const PIPE_OPERATORS = new Set(['|>', '||>', '|||>']);
 
+/** Backward pipes: `f <| x` applies the function on the left. */
+const BACKWARD_PIPE_OPERATORS = new Set(['<|', '<||', '<|||']);
+
 /** Node types whose children are expressions used as values rather than names being declared. */
 const VALUE_PARENTS: ReadonlySet<string> = new Set([
   'application_expression',
@@ -274,11 +277,21 @@ function scopeNamesOf(p: SyntaxNode, source: string): ScopeNames {
     // non-recursive initializer or outside this expression.
     continuationOnly = true;
     for (const binding of p.namedChildren) {
+      // `use! c = conn ()` names its value straight under the expression.
+      if (binding.type === 'identifier') names.add(txt(binding, source));
       if (binding.type !== 'function_or_value_defn') continue;
       for (const { left } of splitBindings(binding)) {
         for (const bound of getBoundNames(left, source)) names.add(bound);
       }
     }
+  } else if (p.type === 'rule') {
+    // `| Some v -> g v`: what the rule's pattern binds is in scope in the rule.
+    const pattern = p.childForFieldName('pattern');
+    if (pattern) collectPatternNames(pattern, source, names);
+  } else if (p.type === 'for_expression') {
+    // `for x in xs do g x`
+    const pattern = childOfTypes(p, 'identifier_pattern', 'paren_pattern', 'tuple_pattern');
+    if (pattern) collectPatternNames(pattern, source, names);
   } else if (p.type === 'method_or_prop_defn') {
     for (const c of p.namedChildren.slice(1, -1)) collectPatternNames(c, source, names);
   } else {
@@ -313,17 +326,56 @@ function unlessParameter(name: string | null, at: SyntaxNode, written: SyntaxNod
 
 /** The right operand of a `x |> f` infix when it is a bare (possibly dotted) name, with the node that names it. */
 function getPipeCallee(node: SyntaxNode, source: string): { name: string; at: SyntaxNode } | null {
-  const op = node.namedChildren.find((c) => c.type === 'infix_op');
-  if (!op || !PIPE_OPERATORS.has(txt(op, source))) return null;
-  const rhs = node.namedChild(node.namedChildCount - 1);
-  if (!rhs || rhs.equals(op)) return null;
-  const target = rhs.type === 'paren_expression' ? rhs.namedChild(0) : rhs;
+  const piped = pipedFunction(node, source);
+  if (!piped) return null;
+  const target = piped.type === 'paren_expression' ? piped.namedChild(0) : piped;
   if (!target || !NAME_NODES.has(target.type)) return null;
   const text = txt(target, source);
-  // A bare capitalised name is read as a value, like `Some` in `Some 1`.
-  if (!text.includes('.') && /^\p{Lu}/u.test(text)) return null;
+  // What a pipe hands its value to is applied, a union case too: `x |> Circle` builds a `Circle`.
   const name = unlessParameter(lastSegment(text), node, target, source);
   return name ? { name, at: target } : null;
+}
+
+/** The operand a pipe applies: the right of `x |> f`, the left of `f <| x`. Null for any other infix. */
+function pipedFunction(node: SyntaxNode, source: string): SyntaxNode | null {
+  const op = node.namedChildren.find((c) => c.type === 'infix_op');
+  const text = op ? txt(op, source) : '';
+  if (PIPE_OPERATORS.has(text)) return node.namedChild(node.namedChildCount - 1);
+  if (BACKWARD_PIPE_OPERATORS.has(text)) return node.namedChild(0);
+  return null;
+}
+
+/**
+ * A name used as a value rather than applied, which the body walk records as a
+ * reference: a function handed on (`List.map helper xs`, `inc >> inc`), a
+ * module value read (`Calc.Limit`), a union case written as a value (`Done`) or
+ * matched in a pattern (`| Circle r ->`). Nothing is called there. A name on a
+ * value (`lo.Length`) is that value's member, a parameter or a local is no
+ * declaration, and the function part of an application or a pipe is a call.
+ */
+function valueName(node: SyntaxNode, source: string): string | null {
+  if (node.type === 'identifier_pattern') {
+    if (!isInMatchRule(node)) return null;
+    const head = node.namedChild(0);
+    const name = head && NAME_NODES.has(head.type) ? lastSegment(txt(head, source)) : '';
+    return /^\p{Lu}/u.test(name) ? name : null;
+  }
+  // `Lib.Cases2.Done` reads as a `dot_expression` of a path and a field.
+  if (node.type !== 'long_identifier' && node.type !== 'long_identifier_or_op' && node.type !== 'dot_expression') return null;
+  const parent = node.parent;
+  if (!parent || parent.type === 'long_identifier_or_op') return null;
+  const isValue =
+    (VALUE_PARENTS.has(parent.type) &&
+      !(parent.type === 'application_expression' && parent.namedChild(0)?.equals(node)) &&
+      // The label of `{ Customer = c }` names a field, not what the value is.
+      !(parent.type === 'field_initializer' && parent.namedChild(0)?.equals(node)) &&
+      !(parent.type === 'infix_expression' && pipedFunction(parent, source)?.equals(node))) ||
+    // `let a () = Done`, `let limit = Calc.Limit`: the whole body.
+    (parent.type === 'function_or_value_defn' && parent.childForFieldName('body')?.equals(node) === true);
+  if (!isValue) return null;
+  const text = txt(node, source);
+  if (text.includes('.')) return /^(?:``|\p{Lu})/u.test(text) && !/[([]/.test(text) ? lastSegment(text) : null;
+  return node.type === 'dot_expression' ? null : unlessParameter(text, node, node, source);
 }
 
 /**
@@ -455,6 +507,16 @@ function visitBody(ctx: ExtractorContext, body: SyntaxNode, ownerId: string): vo
           column: piped.at.startPosition.column,
         });
       }
+    }
+    const value = valueName(n, ctx.source);
+    if (value) {
+      ctx.addUnresolvedReference({
+        fromNodeId: ownerId,
+        referenceName: value,
+        referenceKind: 'references',
+        line: n.startPosition.row + 1,
+        column: n.startPosition.column,
+      });
     }
     if (n.type === 'object_expression') {
       const iface = n.namedChild(0);
@@ -977,28 +1039,7 @@ export const fsharpExtractor: LanguageExtractor = {
     if (node.type === 'application_expression') return getCalleeName(node, source) ?? undefined;
     // A pipe is read from the body walk, which knows where its right operand is written.
     if (node.type === 'infix_expression') return getOperatorCallee(node, source) ?? undefined;
-    // A name used as a value: `List.map LogEvent.information`, `if ok then Red else Green`, `[Red; Green]`.
-    // The function part of an application is the application's own call, and a lowercase name
-    // is as likely a local as a function, so only a qualified reference through a module or type
-    // (`lo.Length` is data) and a bare capitalised one (a union case, a constructor) count.
-    if (
-      (node.type === 'long_identifier' || node.type === 'long_identifier_or_op') &&
-      node.parent !== null &&
-      VALUE_PARENTS.has(node.parent.type) &&
-      !(node.parent.type === 'application_expression' && node.parent.namedChild(0)?.equals(node)) &&
-      // The label of `{ Customer = c }` names a field, not what the value is.
-      !(node.parent.type === 'field_initializer' && node.parent.namedChild(0)?.equals(node))
-    ) {
-      const t = txt(node, source);
-      if (!t.includes('.')) return /^\p{Lu}/u.test(t) ? t : undefined;
-      return node.parent.type === 'application_expression' && /^(?:``|\p{Lu})/u.test(t) ? lastSegment(t) : undefined;
-    }
-    if (node.type === 'identifier_pattern' && isInMatchRule(node)) {
-      // `| Circle r ->`, `| Rect (w, h) ->`, `| None ->`: matching a case uses it, like building it does.
-      const head = node.namedChild(0);
-      const name = head && NAME_NODES.has(head.type) ? lastSegment(txt(head, source)) : '';
-      return /^\p{Lu}/u.test(name) ? name : undefined;
-    }
+    // A name used as a value is a reference, read by the body walk (`valueName`).
     if (node.type === 'generic_new_expression') {
       const fn = node.namedChild(0);
       return fn && (NAME_NODES.has(fn.type) || fn.type === 'dot_expression') ? txt(fn, source) : undefined;

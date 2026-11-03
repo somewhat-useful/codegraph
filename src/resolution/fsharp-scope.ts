@@ -803,6 +803,47 @@ export function matchDotnetNameInFsharp(ref: UnresolvedRef, context: ResolutionC
   return { original: ref, targetNodeId: reached[0]!.id, confidence: 0.9, resolvedBy: 'qualified-name' };
 }
 
+/**
+ * Of the declarations an F# name can mean, the ones F# takes: the name binds to
+ * what became visible last before it. An `open` makes what it opens visible from
+ * its line — so of two opened modules that both define `pick`, the one opened
+ * later is meant — and a declaration of a scope around the reference from its
+ * own line in that file, or from the top of any other file. Several equally late
+ * stay: the caller does not guess between them.
+ */
+export function latestFsharpBindings(candidates: Node[], ref: UnresolvedRef, context: ResolutionContext): Node[] {
+  if (ref.language !== 'fsharp' || candidates.length < 2) return candidates;
+  const scope = scopeOfRef(ref, context);
+  const file = fileScopeOf(ref.filePath, context);
+  // Where each path became visible through an `open` read relative to the scopes around the reference.
+  const openedAt = new Map<string, number>();
+  for (const entry of file.opens) {
+    if (!importApplies(entry, ref)) continue;
+    for (const prefix of scopePrefixes(scope.container)) {
+      const path = joinPath(prefix, entry.node.name);
+      openedAt.set(path, Math.max(openedAt.get(path) ?? -1, entry.node.endLine));
+    }
+  }
+  const visibleFrom = (path: string, declaredAt: number, sameFile: boolean): number => {
+    if (path === '' || path === GLOBAL_NAMESPACE) return 0;
+    const opened = openedAt.get(path) ?? -1;
+    const around = isPathPrefix(path, scope.container) ? (sameFile ? declaredAt : 0) : -1;
+    return Math.max(opened, around);
+  };
+  const qualifier = scope.qualifiers.find(namesContainer);
+  const lines = candidates.map((n) => {
+    const target = scopeOfCandidate(n, context);
+    const sameFile = n.filePath === ref.filePath;
+    if (qualifier === undefined) return Math.max(...target.holders.map((h) => visibleFrom(h, n.startLine, sameFile)), -1);
+    // `Calc.helper`: the module the qualifier starts at is what became visible.
+    if (target.container === qualifier) return 0;
+    const head = target.container.slice(0, target.container.length - qualifier.length - 1);
+    return target.container.endsWith(`.${qualifier}`) ? visibleFrom(head, n.startLine, sameFile) : -1;
+  });
+  const latest = Math.max(...lines);
+  return candidates.filter((_, i) => lines[i] === latest);
+}
+
 /** Is `candidate` something `ref` can mean? Always true for refs and candidates F# has nothing to say about. */
 export function isFsharpCandidateInScope(
   candidate: Node,

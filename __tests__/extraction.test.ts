@@ -700,9 +700,12 @@ let run xs =
     Logger.info "done"
     compute 1 2
 `;
-    const calls = refs(extractFromSource('M.fs', code), 'calls');
+    const result = extractFromSource('M.fs', code);
 
-    expect(calls).toEqual(expect.arrayContaining(['double', 'sum', 'ignore', 'info', 'compute']));
+    expect(refs(result, 'calls')).toEqual(expect.arrayContaining(['map', 'sum', 'ignore', 'info', 'compute']));
+    // `Helpers.double` is handed to `List.map`, not called here.
+    expect(refs(result, 'calls')).not.toContain('double');
+    expect(refs(result, 'references')).toContain('double');
   });
 
   it('should reference the types a signature names, and skip primitives', () => {
@@ -834,12 +837,14 @@ let total (o: Order) (rate: Rate) : Money = Money 0
 
   it('should not call a property read that is passed as an argument', () => {
     const code = ['module M', '', 'let f bb lo xs = bb.EmitZ32 lo.Length', 'let g xs = List.map LogEvent.information xs', ''].join(String.fromCharCode(10));
-    const calls = refs(extractFromSource('M.fs', code), 'calls');
+    const result = extractFromSource('M.fs', code);
+    const calls = refs(result, 'calls');
 
     expect(calls).toContain('EmitZ32');
     expect(calls).not.toContain('Length');
-    // A qualified reference through a module or type is a function reference.
-    expect(calls).toContain('information');
+    // A function handed on through its module is a reference to it, not a call.
+    expect(calls).not.toContain('information');
+    expect(refs(result, 'references')).toContain('information');
   });
 
   it('should find the callee that follows an infix operator, and a pipe once', () => {
@@ -883,13 +888,17 @@ let total (o: Order) (rate: Rate) : Money = Money 0
     expect(result.nodes.find((n) => n.name === 'g')?.signature).not.toContain(String.fromCharCode(10));
   });
 
-  it('should use a union case where a pattern matches it, once', () => {
+  it('should reference a union case where a pattern matches it, once', () => {
     const code = ['module M', '', 'let area s =', '    match s with', '    | Circle r -> r', '    | Rect (w, h) -> w', '    | None -> 0.0', ''].join(String.fromCharCode(10));
-    const calls = refs(extractFromSource('M.fs', code), 'calls');
+    const result = extractFromSource('M.fs', code);
+    const used = refs(result, 'references');
 
-    for (const name of ['Circle', 'Rect', 'None']) expect(calls.filter((c) => c === name)).toHaveLength(1);
-    // The binding's own pattern is not a use.
-    expect(calls).not.toContain('area');
+    // Matching a case depends on it; nothing is called.
+    for (const name of ['Circle', 'Rect', 'None']) expect(used.filter((c) => c === name)).toHaveLength(1);
+    expect(refs(result, 'calls')).toEqual([]);
+    // The binding's own pattern is not a use, and what a rule binds is a local.
+    expect(used).not.toContain('area');
+    expect(used).not.toContain('r');
   });
 
   it('should not call the text of an SRTP constraint, and should call a parenthesised function', () => {
@@ -900,7 +909,7 @@ let total (o: Order) (rate: Rate) : Money = Money 0
     expect(calls).toContain('helper');
   });
 
-  it('should use a capitalised name written as a value, and not a lowercase one', () => {
+  it('should reference a name written as a value, unless a parameter or a local binds it', () => {
     const code = [
       'module M',
       '',
@@ -909,14 +918,17 @@ let total (o: Order) (rate: Rate) : Money = Money 0
       'let c = f Red',
       'let d = { Color = Red }',
       'let e xs = List.map helper xs',
+      'let g helper xs = List.map helper xs',
       '',
     ].join(String.fromCharCode(10));
-    const calls = refs(extractFromSource('M.fs', code), 'calls');
+    const result = extractFromSource('M.fs', code);
+    const used = refs(result, 'references');
 
-    expect(calls.filter((c) => c === 'Red')).toHaveLength(4);
-    expect(calls.filter((c) => c === 'Green')).toHaveLength(2);
-    // A lowercase name is as likely a local as a function.
-    expect(calls).not.toContain('helper');
+    expect(used.filter((c) => c === 'Red')).toHaveLength(4);
+    expect(used.filter((c) => c === 'Green')).toHaveLength(2);
+    // `helper` handed to `List.map` is the module's function, except where a parameter is named so.
+    expect(used.filter((c) => c === 'helper')).toHaveLength(1);
+    expect(refs(result, 'calls')).not.toContain('Red');
   });
 
   it('should read `function` bindings as functions and abstract slots without an arrow as properties', () => {
@@ -949,7 +961,9 @@ let total (o: Order) (rate: Rate) : Money = Money 0
   it('should not take a record label, or a name a parameter shadows, for a call', () => {
     const nl = String.fromCharCode(10);
     const labels = ['module M', '', 'let mk c = { Customer = c; Status = Active }', ''].join(nl);
-    expect(refs(extractFromSource('M.fs', labels), 'calls')).toEqual(['Active']);
+    // `Active` is a value the record holds; the label `Customer` and the parameter `c` are no symbol's.
+    expect(refs(extractFromSource('M.fs', labels), 'references')).toEqual(['Active']);
+    expect(refs(extractFromSource('M.fs', labels), 'calls')).toEqual([]);
 
     const shadowed = [
       'module M',
