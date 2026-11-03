@@ -4199,6 +4199,9 @@ export function isVisibleAcrossFiles(candidate: Node, ref: UnresolvedRef, contex
   if (ref.language === 'go' && candidate.language === 'go' &&
       (isGoExternalQualified(ref, context) || !isInGoQualifierPackage(candidate, ref, context))) return false;
   if ((ref.language === 'csharp' || ref.language === 'razor') && !csharpTypeArityFits(candidate, ref, context)) return false;
+  // An F# name is its file's above it, its enclosing namespace or module's, or an opened one's — in
+  // its own file too, which F# reads top to bottom.
+  if (!isFsharpCandidateInScope(candidate, ref, context, dotnetScopeForFsharp)) return false;
   if (candidate.filePath === ref.filePath) return true;
   // A vendored minified bundle's names are mangled: healthchecks' 369 `$(…)`
   // (jQuery, a global) went to a one-letter helper inside bootstrap-native.min.js.
@@ -4216,8 +4219,6 @@ export function isVisibleAcrossFiles(candidate: Node, ref: UnresolvedRef, contex
   if (!isPhpClassVisible(candidate, ref, context)) return false;
   // A bare Java type name is its package's, an import's, or a nested type in reach.
   if (!isJavaTypeVisible(candidate, ref, context)) return false;
-  // An F# name is its file's, its enclosing namespace or module's, or an opened one's.
-  if (!isFsharpCandidateInScope(candidate, ref, context, dotnetScopeForFsharp)) return false;
   // A Dart `extension on Token { … }` has no name: `Token` is analyzer's type,
   // not bloc_lint's extension block (84 refs went there).
   if (dartExtensionDecl(candidate, context)?.named === false) return false;
@@ -8076,16 +8077,16 @@ function csharpNamespaceScope(file: string, context: ResolutionContext): { names
   return scope;
 }
 
-/**
- * What a C# or VB.NET file can name, for F#'s check of a name it writes
- * (`isFsharpReachableFromDotnet`): the same namespaces, usings and aliases the
- * C# and VB.NET lookups here use, and the full paths of its `using static`.
- */
 /** The F# declaration a C# or VB.NET name means, by that language's lookup (see `matchDotnetNameInFsharp`). */
 export function matchDotnetNameIntoFsharp(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
   return matchDotnetNameInFsharp(ref, context, dotnetScopeForFsharp);
 }
 
+/**
+ * What a C# or VB.NET file can name, for F#'s check of a name it writes
+ * (`isFsharpReachableFromDotnet`): the same namespaces, usings and aliases the
+ * C# and VB.NET lookups here use, and the full paths of its `using static`.
+ */
 function dotnetScopeForFsharp(ref: UnresolvedRef, context: ResolutionContext): DotnetFileScope | null {
   if (ref.language === 'csharp') {
     const scope = csharpNamespaceScope(ref.filePath, context);

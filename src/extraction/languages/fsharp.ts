@@ -645,6 +645,11 @@ function addModuleAlias(ctx: ExtractorContext, alias: string, target: SyntaxNode
   });
 }
 
+/** Whether `module rec M` or `namespace rec N` is written: the `rec` between the keyword and the name. */
+function isRecursiveScope(node: SyntaxNode, nameNode: SyntaxNode, source: string): boolean {
+  return /\brec\b/.test(source.slice(node.startIndex, nameNode.startIndex).replace(/\[<[\s\S]*?>\]/g, ''));
+}
+
 /** Where code written straight in a file, namespace or module sits: what runs it is that scope. */
 const TOP_LEVEL_SCOPES: ReadonlySet<string> = new Set(['file', 'named_module', 'module_defn', 'namespace']);
 
@@ -1177,8 +1182,6 @@ export const fsharpExtractor: LanguageExtractor = {
   nameField: '',
   bodyField: '',
   paramsField: '',
-  // The offside scanner asks for a column on nearly every token.
-  parseInChunks: true,
 
   extractBareCall: (node, source) => {
     if (node.type === 'application_expression') return getCalleeName(node, source) ?? undefined;
@@ -1219,10 +1222,12 @@ export const fsharpExtractor: LanguageExtractor = {
       // `[<AutoOpen>] module M` and `module private M`: both change who can reach the contents.
       const attributes = attributeNames(childOfTypes(node, 'attributes'), source);
       const access = accessOf(node, source);
+      // `module rec M`: everything in it sees everything else in it, wherever it is declared.
+      const decorators = isRecursiveScope(node, nameNode!, source) ? [...attributes, 'rec'] : attributes;
       const modNode = ctx.createNode('module', moduleName, node, {
         isExported: access !== 'private',
         ...(access ? { visibility: access } : {}),
-        ...(attributes.length > 0 ? { decorators: attributes } : {}),
+        ...(decorators.length > 0 ? { decorators } : {}),
       });
       if (modNode) {
         ctx.pushScope(modNode.id);
@@ -1237,7 +1242,10 @@ export const fsharpExtractor: LanguageExtractor = {
       // `namespace global` names nothing: its declarations are visible everywhere.
       const nsName = nameNode ? txt(nameNode, source) : /^namespace\s+global\b/.test(txt(node, source)) ? 'global' : '';
       if (!nsName) return false;
-      const nsNode = ctx.createNode('namespace', nsName, node, { isExported: true });
+      const nsNode = ctx.createNode('namespace', nsName, node, {
+        isExported: true,
+        ...(nameNode && isRecursiveScope(node, nameNode, source) ? { decorators: ['rec'] } : {}),
+      });
       if (nsNode) {
         ctx.pushScope(nsNode.id);
         for (const child of node.namedChildren) ctx.visitNode(child);

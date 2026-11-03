@@ -90,6 +90,13 @@ describe('looksLikeFsharp', () => {
     expect(looksLikeFsharp(GLSL_BARE)).toBe(false);
   });
 
+  it('reads a GLSL include of helper functions, with no preprocessor line or `main`, as not F#', () => {
+    expect(looksLikeFsharp('// lighting helpers\nvec3 shade(vec3 n, vec3 l) {\n    return max(dot(n, l), 0.0) * vec3(1.0);\n}\n')).toBe(false);
+    expect(looksLikeFsharp('const float PI = 3.14159;\nfloat sq(float x) { return x * x; }\n')).toBe(false);
+    // An F# line still wins: a shader kept in a string.
+    expect(looksLikeFsharp('let shader = """\nvec3 shade(vec3 n) { return n; }\n"""\n')).toBe(true);
+  });
+
   it('reads Forth as not F#', () => {
     expect(looksLikeFsharp(FORTH)).toBe(false);
   });

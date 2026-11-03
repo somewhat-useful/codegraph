@@ -303,7 +303,8 @@ const FSHARP_SIGNALS: readonly RegExp[] = [
 
 /**
  * GLSL's preprocessor lines and declarations, which F# never writes outside a
- * string: F# has `#if` / `#else` / `#endif`, but no `#version` or `#define`.
+ * string: F# has `#if` / `#else` / `#endif`, but no `#version` or `#define`,
+ * and never writes a type before the name it declares.
  */
 const GLSL_SIGNAL_RE = new RegExp(
   String.raw`^[ \t\uFEFF]*(?:` +
@@ -313,6 +314,9 @@ const GLSL_SIGNAL_RE = new RegExp(
     String.raw`|layout[ \t]*\([ \t]*(?:location|binding|set|std140|std430|local_size_[xyz])\b` +
     String.raw`|(?:in|out|inout)[ \t]+(?:(?:highp|mediump|lowp|flat|smooth)[ \t]+)*(?:[biud]?vec[234]|float|int|uint|bool|mat[234](?:x[234])?|sampler\w*)[ \t]+\w+[ \t]*;` +
     String.raw`|void[ \t]+main[ \t]*\(` +
+    // A C-style typed function or variable: `vec3 shade(vec3 n) {`, `const float k = 0.5;` — an
+    // include of helpers has nothing else. F# writes no type before a name.
+    String.raw`|(?:(?:const|highp|mediump|lowp)[ \t]+)*(?:void|float|double|u?int|bool|[biud]?vec[234]|d?mat[234](?:x[234])?|sampler\w+)[ \t]+[A-Za-z_]\w*[ \t]*(?:\(|=[^=]|;|\[)` +
   ')',
   'm'
 );

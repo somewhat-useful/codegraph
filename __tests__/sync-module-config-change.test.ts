@@ -347,4 +347,30 @@ describe('a sync follows a module-config change (#2977)', () => {
     expect(stateOf(tsRoot, ts)).toEqual(tsBefore);
     expect(stateOf(goRoot, go)).toEqual(goBefore);
   }, 120_000);
+
+  const FSHARP_BEFORE: Files = {
+    'App.fsproj': '<Project><ItemGroup><Compile Include="Util.fs" /><Compile Include="Use.fs" /></ItemGroup></Project>',
+    'Util.fs': 'module Util\n\nlet helper () = 1\n',
+    'Use.fs': 'module Use\n\nlet run () = Util.helper ()\n',
+  };
+
+  it('an .fsproj that compiles a file later hides what it declares from the files before it', async () => {
+    const { root, graph, full } = await syncEdit(FSHARP_BEFORE, {
+      'App.fsproj': '<Project><ItemGroup><Compile Include="Use.fs" /><Compile Include="Util.fs" /></ItemGroup></Project>',
+    });
+    expect(callTargets(graph, 'Use::run')).toEqual([]);
+    expect(stateOf(root, graph)).toEqual(full);
+  }, 120_000);
+
+  it('an .fsi that appears beside an F# file hides what it leaves out, from F# and from C#', async () => {
+    const before: Files = {
+      ...FSHARP_BEFORE,
+      'Web.cs': 'namespace Web { class C { void M() { Util.helper(); } } }\n',
+    };
+    const { root, graph, full } = await syncEdit(before, { 'Util.fsi': 'module Util\n\nval other : int -> int\n' });
+    expect(callTargets(graph, 'Use::run')).toEqual([]);
+    expect(callTargets(graph, 'Web::C::M')).toEqual([]);
+    expect(stateOf(root, graph)).toEqual(full);
+  }, 120_000);
+
 });

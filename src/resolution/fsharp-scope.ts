@@ -34,6 +34,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import type { Node } from '../types';
 import type { ResolutionContext, ResolvedRef, UnresolvedRef } from './types';
+import { escapeRegExp } from '../utils';
 
 /** Reference kinds that name a declaration (an `open` names a namespace, which is not a symbol). */
 const SYMBOL_REFERENCE_KINDS: ReadonlySet<string> = new Set([
@@ -53,6 +54,11 @@ const NON_SYMBOL_KINDS: ReadonlySet<string> = new Set(['file', 'namespace', 'imp
 
 /** What a type owns: reached through a value or a type name, never bare. */
 const MEMBER_KINDS: ReadonlySet<string> = new Set(['method', 'property', 'field']);
+
+/** A type's member, not a class's `let` binding (which the extractor records as a method or field marked `let`). */
+function isTypeMember(node: Node): boolean {
+  return MEMBER_KINDS.has(node.kind) && node.decorators?.[0] !== 'let';
+}
 
 /** Languages an F# name can be written against: its own and the other .NET ones. */
 const SCOPED_LANGUAGES: ReadonlySet<string> = new Set(['fsharp', 'csharp', 'vbnet']);
@@ -170,7 +176,8 @@ function openedPaths(
   declared?: ReadonlySet<string>,
 ): { path: string; line: number }[] {
   const out: { path: string; line: number }[] = [];
-  const bases: string[] = [...prefixes];
+  // `namespace global` is around every file: `open Util` opens its module `Util`.
+  const bases: string[] = [...prefixes, GLOBAL_NAMESPACE];
   for (const { name, line } of opens) {
     const reached = [...new Set(bases.map((base) => joinPath(base, name)))];
     // An `open` names one namespace or module: of the paths it could be, the ones the project
@@ -181,6 +188,25 @@ function openedPaths(
     if (declared) for (const path of opened) if (!bases.includes(path)) bases.push(path);
   }
   return out;
+}
+
+const FSHARP_FILES = new WeakMap<ResolutionContext, string[]>();
+
+/** The project's indexed F# files, listed once per context: a project without any pays nothing for F#. */
+function fsharpFiles(context: ResolutionContext): string[] {
+  let files = FSHARP_FILES.get(context);
+  if (!files) FSHARP_FILES.set(context, (files = context.getAllFiles().filter((f) => /\.fsx?$/i.test(f))));
+  return files;
+}
+
+/** Whether the project has F# code at all. */
+export function hasFsharpFiles(context: ResolutionContext): boolean {
+  return fsharpFiles(context).length > 0;
+}
+
+/** The F# declarations of the given kinds, read from the F# files alone. */
+function fsharpNodesOfKinds(kinds: ReadonlySet<string>, context: ResolutionContext): Node[] {
+  return fsharpFiles(context).flatMap((f) => context.getNodesInFile(f).filter((n) => n.language === 'fsharp' && kinds.has(n.kind)));
 }
 
 const DECLARED_SCOPES = new WeakMap<ResolutionContext, Set<string>>();
@@ -376,6 +402,8 @@ interface FileScope {
   scopes: Map<string, Node>;
   /** The same by dotted path: a file-level `module A.B.C` is one segment of the qualified name. */
   byPath: Map<string, Node>;
+  /** Qualified names of the file's types marked `[<RequireQualifiedAccess>]`: their cases are written through them. */
+  requireQualified: Set<string>;
 }
 
 function containsPosition(node: Node, line: number, column: number): boolean {
@@ -397,10 +425,11 @@ function fileScopeOf(filePath: string, context: ResolutionContext): FileScope {
   if (!perFile) FILE_SCOPES.set(context, (perFile = new Map()));
   const cached = perFile.get(filePath);
   if (cached) return cached;
-  const scope: FileScope = { opens: [], openTypes: [], aliases: [], scopes: new Map(), byPath: new Map() };
+  const scope: FileScope = { opens: [], openTypes: [], aliases: [], scopes: new Map(), byPath: new Map(), requireQualified: new Set() };
   const nodes = context.getNodesInFile(filePath);
   const containers = nodes.filter((n) => n.kind === 'module' || n.kind === 'namespace');
   for (const n of nodes) {
+    if (n.decorators?.some((d) => /^RequireQualifiedAccess(?:Attribute)?$/.test(d))) scope.requireQualified.add(n.qualifiedName);
     if (n.kind === 'module' || n.kind === 'enum' || n.kind === 'namespace') {
       scope.scopes.set(n.qualifiedName, n);
       scope.byPath.set(n.qualifiedName.split('::').join('.'), n);
@@ -640,7 +669,7 @@ function extensionsByName(context: ResolutionContext): Map<string, Node[]> {
   let byName = EXTENSIONS.get(context);
   if (byName) return byName;
   byName = new Map();
-  for (const n of context.getNodesByKind('class')) {
+  for (const n of fsharpNodesOfKinds(new Set(['class']), context)) {
     if (!isTypeExtension(n)) continue;
     const extended = lastSegmentOf(n.name).replace(/<.*$/, '');
     byName.set(extended, [...(byName.get(extended) ?? []), n]);
@@ -703,20 +732,18 @@ function lastSegmentOf(path: string): string {
   return path.slice(path.lastIndexOf('.') + 1);
 }
 
-function escapeRegExp(text: string): string {
-  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
-
 /**
  * The containers whose opening exposes an F# candidate unqualified: the one it
  * is declared in — for a union case, the one its type is declared in, and
- * none for a case of a .NET-style `enum`, which is always written through its
- * type — and, while that is an `[<AutoOpen>]` module, the one around it.
+ * none for a case of a .NET-style `enum` or of a union marked
+ * `[<RequireQualifiedAccess>]`, which are always written through their type —
+ * and, while that is an `[<AutoOpen>]` module, the one around it.
  */
 function holdersOf(candidate: Node, file: FileScope): string[] {
   const segments = candidate.qualifiedName.split('::').slice(0, -1);
   if (candidate.kind === 'enum_member') {
-    if (file.scopes.get(segments.join('::'))?.kind === 'enum') return [];
+    const owner = segments.join('::');
+    if (file.scopes.get(owner)?.kind === 'enum' || file.requireQualified.has(owner)) return [];
     segments.pop();
   }
   if (segments.length === 0) return [containerOfNode(candidate)];
@@ -754,31 +781,32 @@ function compiledNameOf(node: Node): string | null {
 
 const COMPILED_NAMES = new WeakMap<ResolutionContext, Map<string, Node[]>>();
 
-/** Whether some F# declaration is compiled under `name` by a `[<CompiledName>]` that differs from its F# name. */
+/** Whether some F# declaration may be compiled under `name`, in any case, by a `[<CompiledName>]` that differs from its F# name. */
 export function isFsharpCompiledName(name: string, context: ResolutionContext): boolean {
   return compiledNamed(name, context).length > 0;
 }
 
+/** Kinds a `[<CompiledName>]` or a union case's `New<Case>` renames. */
+const COMPILED_NAME_KINDS: ReadonlySet<string> = new Set(['function', 'method', 'property', 'variable', 'constant', 'enum_member']);
+
 /**
  * F# declarations .NET names `name` where F# does not — a `[<CompiledName>]`, a
- * union case's `New<Case>` — which a lookup by their F# name does not find.
+ * union case's `New<Case>` — which a lookup by their F# name does not find. By
+ * name in any case: VB.NET writes it in any; C#'s exact spelling is checked
+ * where the name is ranked (`dotnetLookupRank`).
  */
 function compiledNamed(name: string, context: ResolutionContext): Node[] {
   let byName = COMPILED_NAMES.get(context);
   if (!byName) {
     byName = new Map();
-    for (const kind of ['function', 'method', 'property', 'variable', 'constant', 'enum_member'] as const) {
-      for (const n of context.getNodesByKind(kind)) {
-        if (n.language !== 'fsharp') continue;
-        const compiled = compiledNameOf(n) ?? (n.kind === 'enum_member' && n.signature ? `New${n.name}` : null);
-        if (compiled !== null && compiled.toLowerCase() !== n.name.toLowerCase()) {
-          byName.set(compiled, [...(byName.get(compiled) ?? []), n]);
-        }
-      }
+    for (const n of fsharpNodesOfKinds(COMPILED_NAME_KINDS, context)) {
+      const compiled = compiledNameOf(n) ?? (n.kind === 'enum_member' && n.signature ? `New${n.name}` : null);
+      const key = compiled?.toLowerCase();
+      if (key !== undefined && key !== n.name.toLowerCase()) byName.set(key, [...(byName.get(key) ?? []), n]);
     }
     COMPILED_NAMES.set(context, byName);
   }
-  return byName.get(name) ?? [];
+  return byName.get(name.toLowerCase()) ?? [];
 }
 
 const DOTNET_TARGETS = new WeakMap<ResolutionContext, Map<string, DotnetTarget>>();
@@ -877,6 +905,9 @@ export function clearFsharpScopeCaches(context: ResolutionContext): void {
   SIGNATURES.delete(context);
   DECLARED_SCOPES.delete(context);
   COMPILED_NAMES.delete(context);
+  DOTNET_NAMESPACES.delete(context);
+  ASSEMBLY_INTERNAL.delete(context);
+  FSHARP_FILES.delete(context);
   FILE_SCOPES.delete(context);
   DECLARED_NAMESPACES.delete(context);
   CANDIDATE_SCOPES.delete(context);
@@ -921,6 +952,84 @@ function writtenDotnetName(ref: UnresolvedRef, context: ResolutionContext): stri
   return qualifier && qualifier !== '_' ? `${qualifier}.${ref.referenceName}` : ref.referenceName;
 }
 
+/**
+ * Whether F# compiles `candidate` so that no other assembly sees it: it, or a
+ * module or type around it, is `private` or `internal` (F# emits `private` as
+ * `internal`), or it is a class's `let`. A C# or VB.NET project is always
+ * another assembly than the F# one.
+ */
+function isAssemblyInternal(candidate: Node, context: ResolutionContext): boolean {
+  let perContext = ASSEMBLY_INTERNAL.get(context);
+  if (!perContext) ASSEMBLY_INTERNAL.set(context, (perContext = new Map()));
+  const cached = perContext.get(candidate.id);
+  if (cached !== undefined) return cached;
+  const closed = (n: Node): boolean => n.visibility === 'private' || n.visibility === 'internal';
+  const internal = closed(candidate) || candidate.decorators?.[0] === 'let' ||
+    context.getNodesInFile(candidate.filePath).some((n) =>
+      n.id !== candidate.id && closed(n) && TYPE_KINDS.has(n.kind) && containsPosition(n, candidate.startLine, candidate.startColumn));
+  perContext.set(candidate.id, internal);
+  return internal;
+}
+
+const ASSEMBLY_INTERNAL = new WeakMap<ResolutionContext, Map<string, boolean>>();
+
+const DOTNET_NAMESPACES = new WeakMap<ResolutionContext, Set<string>>();
+
+/** The namespaces C# and VB.NET code declares, by dotted path (VB.NET's lowercased). */
+function dotnetNamespaces(context: ResolutionContext): Set<string> {
+  let paths = DOTNET_NAMESPACES.get(context);
+  if (paths) return paths;
+  paths = new Set();
+  for (const n of context.getNodesByKind('namespace')) {
+    if (!DOTNET_REFERRERS.has(n.language)) continue;
+    const full = n.qualifiedName.split('::').join('.');
+    for (const prefix of scopePrefixes(n.language === 'vbnet' ? full.toLowerCase() : full)) if (prefix !== '') paths.add(prefix);
+  }
+  DOTNET_NAMESPACES.set(context, paths);
+  return paths;
+}
+
+/** A C# or VB.NET declaration as its own language names it: the namespace around it, then the types that hold it. */
+function dotnetDeclarationTarget(node: Node, context: ResolutionContext): DotnetTarget {
+  const segments = node.qualifiedName.split('::');
+  const name = segments.pop() ?? node.name;
+  const container = segments.join('.');
+  const namespaces = dotnetNamespaces(context);
+  const parts = container === '' ? [] : container.split('.');
+  let namespace = '';
+  for (let i = parts.length; i > 0; i--) {
+    const prefix = parts.slice(0, i).join('.');
+    if (namespaces.has(node.language === 'vbnet' ? prefix.toLowerCase() : prefix)) {
+      namespace = prefix;
+      break;
+    }
+  }
+  return { reachable: true, namespace, container, name, kind: node.kind, isStatic: !MEMBER_KINDS.has(node.kind) || node.isStatic === true };
+}
+
+const DOTNET_SHADOWS = new WeakMap<UnresolvedRef, number | null>();
+
+/**
+ * Whether a C# or VB.NET declaration the reference's own lookup finds at
+ * `rank` or nearer stands in the way of an F# one found at `rank`: from
+ * `namespace Shop.Web` with `using Shop.Domain;`, `Customer` is C#'s
+ * `Shop.Web.Customer` before F#'s `Shop.Domain.Customer`, and two equally near
+ * are an ambiguity no compiling code has.
+ */
+function isShadowedByDotnet(rank: number, ref: UnresolvedRef, file: DotnetFileScope, written: string, context: ResolutionContext): boolean {
+  let nearest = DOTNET_SHADOWS.get(ref);
+  if (nearest === undefined) {
+    const name = ref.referenceName.slice(ref.referenceName.lastIndexOf('.') + 1);
+    const ranks = context.getNodesByLowerName(name.toLowerCase())
+      .filter((n) => DOTNET_REFERRERS.has(n.language) && !NON_SYMBOL_KINDS.has(n.kind))
+      .map((n) => dotnetLookupRank(file, written, dotnetDeclarationTarget(n, context)))
+      .filter((r): r is number => r !== null);
+    nearest = ranks.length > 0 ? Math.min(...ranks) : null;
+    DOTNET_SHADOWS.set(ref, nearest);
+  }
+  return nearest !== null && nearest <= rank;
+}
+
 /** What each reference kind of a C# or VB.NET name can land on in F#: a call invokes, a construction builds. */
 const DOTNET_TARGET_KINDS: Readonly<Record<string, ReadonlySet<string>>> = {
   calls: new Set(['function', 'method', 'property', 'variable', 'constant', 'enum_member']),
@@ -935,7 +1044,7 @@ const DOTNET_TARGET_KINDS: Readonly<Record<string, ReadonlySet<string>>> = {
  * is neither. Null unless exactly one F# declaration is reached: silent beats wrong.
  */
 export function matchDotnetNameInFsharp(ref: UnresolvedRef, context: ResolutionContext, read: DotnetScopeReader): ResolvedRef | null {
-  if (!DOTNET_REFERRERS.has(ref.language) || !SYMBOL_REFERENCE_KINDS.has(ref.referenceKind)) return null;
+  if (!DOTNET_REFERRERS.has(ref.language) || !SYMBOL_REFERENCE_KINDS.has(ref.referenceKind) || !hasFsharpFiles(context)) return null;
   const name = ref.referenceName.slice(ref.referenceName.lastIndexOf('.') + 1);
   if (name === '') return null;
   // A `[<CompiledName>]` can differ from the F# name in case only: look it up by both.
@@ -943,7 +1052,7 @@ export function matchDotnetNameInFsharp(ref: UnresolvedRef, context: ResolutionC
   const allowed = DOTNET_TARGET_KINDS[ref.referenceKind];
   const declared = [...named, ...compiledNamed(name, context)]
     .filter((n) => n.language === 'fsharp' && !NON_SYMBOL_KINDS.has(n.kind) && !isTypeExtension(n) && (!allowed || allowed.has(n.kind)) &&
-      !isHiddenBySignature(n, context));
+      !isHiddenBySignature(n, context) && !isAssemblyInternal(n, context));
   if (declared.length === 0) return null;
   const file = dotnetFileScopeOf(ref, context, read);
   if (!file) return null;
@@ -954,6 +1063,8 @@ export function matchDotnetNameInFsharp(ref: UnresolvedRef, context: ResolutionC
     .filter((r): r is { n: Node; rank: number } => r.rank !== null);
   if (ranked.length === 0) return null;
   const best = Math.min(...ranked.map((r) => r.rank));
+  // A C# or VB.NET declaration the lookup finds as near or nearer is what the name means.
+  if (isShadowedByDotnet(best, ref, file, written, context)) return null;
   const reached = ranked.filter((r) => r.rank === best).map((r) => r.n);
   if (reached.some((n) => n.qualifiedName !== reached[0]!.qualifiedName)) return null;
   return { original: ref, targetNodeId: reached[0]!.id, confidence: 0.9, resolvedBy: 'qualified-name' };
@@ -991,13 +1102,123 @@ export function latestFsharpBindings(candidates: Node[], ref: UnresolvedRef, con
   });
   const latest = Math.max(...lines);
   const visible = candidates.filter((_, i) => lines[i] === latest);
-  // Declared side by side, as one module or namespace's in one file: the later declaration shadows the earlier.
+  // Declared side by side, as one module or namespace's in one file: the later declaration shadows the
+  // earlier. Not a type's members: two of one name are overloads, which the arguments choose between.
   const holder = (n: Node): string => `${n.filePath}|${scopeOfCandidate(n, context).holders[0] ?? ''}`;
-  if (visible.length > 1 && visible.every((n) => holder(n) === holder(visible[0]!))) {
+  if (visible.length > 1 && !visible.some(isTypeMember) && visible.every((n) => holder(n) === holder(visible[0]!))) {
     const last = Math.max(...visible.map((n) => n.startLine));
     return visible.filter((n) => n.startLine === last);
   }
-  return visible;
+  return visible.length > 1 && visible.every((n) => isTypeMember(n) && n.qualifiedName === visible[0]!.qualifiedName)
+    ? overloadsFitting(visible, ref, context)
+    : visible;
+}
+
+/** F# literals by the type they are: what an argument written as one is. */
+function literalType(arg: string): string | null {
+  if (/^(?:\$|@|\$@|@\$)?"/.test(arg)) return 'String';
+  if (/^'(?:\\.|[^'\\])'$/.test(arg)) return 'Char';
+  if (/^(?:true|false)$/.test(arg)) return 'Boolean';
+  if (/^-?\d[\d_]*(?:\.\d[\d_]*)?(?:[eE][-+]?\d+)$|^-?\d[\d_]*\.\d*$/.test(arg)) return 'Double';
+  if (/^-?\d[\d_]*$/.test(arg)) return 'Int32';
+  if (/^-?\d[\d_]*L$/.test(arg)) return 'Int64';
+  if (/^-?\d[\d_]*m$/i.test(arg)) return 'Decimal';
+  return null;
+}
+
+/**
+ * How a parameter type written `param` takes an argument of literal type
+ * `literal`: 2 exactly, 1 through a conversion F# applies to a method argument
+ * (an `int` where an `int64`, a `float` or an `obj` is taken), 0 when either is
+ * unknown, -1 never.
+ */
+function literalFits(literal: string | null, param: string | null): number {
+  if (literal === null || param === null) return 0;
+  const simple = lastSegmentOf(param.replace(/<.*$/, '').trim());
+  const type = FSHARP_TYPE_ABBREVIATIONS[simple] ?? simple;
+  if (type === literal) return 2;
+  if (type === 'Object' || (literal === 'Int32' && (type === 'Int64' || type === 'Double' || type === 'IntPtr'))) return 1;
+  // A type parameter takes anything, and a type the project declares may convert from it
+  // (`op_Implicit`); a .NET primitive or an F# type written in lower case (`seq`, `list`) does not.
+  if (simple.startsWith("'")) return 0;
+  return /^[a-z]/.test(simple) || Object.values(FSHARP_TYPE_ABBREVIATIONS).includes(type) ? -1 : 0;
+}
+
+/** Splits `a, (b, c), d` at its top-level commas. */
+function splitTopLevel(text: string): string[] {
+  const parts: string[] = [];
+  let depth = 0;
+  let quoted = false;
+  let start = 0;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i]!;
+    if (ch === '"' && text[i - 1] !== '\\') quoted = !quoted;
+    if (quoted) continue;
+    if ('([{<'.includes(ch)) depth++;
+    else if (')]}>'.includes(ch)) depth--;
+    else if (ch === ',' && depth === 0) {
+      parts.push(text.slice(start, i).trim());
+      start = i + 1;
+    }
+  }
+  const last = text.slice(start).trim();
+  if (last !== '' || parts.length > 0) parts.push(last);
+  return parts;
+}
+
+/** The text of the parenthesised group that opens `text`, without its parentheses, or null. */
+function leadingParenGroup(text: string): string | null {
+  if (!text.startsWith('(')) return null;
+  let depth = 0;
+  for (let i = 0; i < text.length; i++) {
+    if (text[i] === '(') depth++;
+    else if (text[i] === ')' && --depth === 0) return text.slice(1, i);
+  }
+  return null;
+}
+
+/**
+ * Of a type's overloads of one method, the ones the call's arguments fit, as
+ * F# picks between them: by how many arguments the call passes, then by the
+ * types of the literals among them. All of them when the call says too little.
+ */
+function overloadsFitting(overloads: Node[], ref: UnresolvedRef, context: ResolutionContext): Node[] {
+  const args = callArguments(ref, overloads[0]!.name, context);
+  if (args === null) return overloads;
+  const scored = overloads.map((n) => {
+    const group = leadingParenGroup((n.signature ?? '').trim());
+    const params = group === null ? null : splitTopLevel(group);
+    if (params === null) return { n, score: 0 };
+    if (params.length !== args.length) return { n, score: -1 };
+    let score = 1;
+    for (let i = 0; i < args.length; i++) {
+      const colon = params[i]!.indexOf(':');
+      const fit = literalFits(literalType(args[i]!), colon < 0 ? null : params[i]!.slice(colon + 1));
+      if (fit < 0) return { n, score: -1 };
+      score += fit;
+    }
+    return { n, score };
+  });
+  const best = Math.max(...scored.map((s) => s.score));
+  if (best < 0) return overloads;
+  return scored.filter((s) => s.score === best).map((s) => s.n);
+}
+
+/** The arguments a call to `name` at `ref` passes: `(1, "a")` → ['1', '"a"'], `()` → [], `M x` → ['x']; null when unread. */
+function callArguments(ref: UnresolvedRef, name: string, context: ResolutionContext): string[] | null {
+  const lines = fileLines(ref.filePath, context);
+  for (let i = 0; i < QUALIFIER_WINDOW; i++) {
+    const line = lines[ref.line - 1 + i];
+    if (line === undefined) return null;
+    const at = indexOfWord(line, name, i === 0 ? Math.min(ref.column, line.length) : 0);
+    if (at < 0) continue;
+    const rest = line.slice(at + name.length).trimStart();
+    const group = leadingParenGroup(rest);
+    if (group !== null) return group.trim() === '' ? [] : splitTopLevel(group);
+    const token = /^(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])'|[^\s)\]|,;]+)/.exec(rest);
+    return token ? [token[0]] : null;
+  }
+  return null;
 }
 
 /**
@@ -1075,8 +1296,8 @@ function compileOrderOf(file: string, context: ResolutionContext): Map<string, n
         }
         order = new Map();
         let index = 0;
-        for (const m of text.matchAll(/<Compile\s+Include\s*=\s*"([^"*?]+)"/gi)) {
-          const listed = path.posix.normalize(path.posix.join(key, m[1]!.replace(/\\/g, '/')));
+        for (const item of fsprojCompileItems(text)) {
+          const listed = path.posix.normalize(path.posix.join(key, item));
           if (!order.has(listed)) order.set(listed, index++);
         }
       }
@@ -1086,6 +1307,97 @@ function compileOrderOf(file: string, context: ResolutionContext): Map<string, n
     if (order) return null;
     if (key === '') return null;
   }
+}
+
+/** Kinds a `let` binds: in its own body only when written `let rec`. */
+const LET_BOUND_KINDS: ReadonlySet<string> = new Set(['function', 'variable', 'constant']);
+
+/**
+ * Whether `candidate`, declared in `ref`'s own file, is not in scope yet where
+ * `ref` is written: a file is read top to bottom, so a name means what is
+ * declared above it, and a `let` without `rec` does not see itself in its own
+ * body (the name there is an earlier one). Except inside a `module rec` or
+ * `namespace rec`, among the bindings of one `let rec … and …` or the types of
+ * one `type … and …`, and among a type's members, which see each other
+ * wherever they are written.
+ */
+function isNotYetInScope(candidate: Node, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  if (isTypeMember(candidate)) return false;
+  const below = candidate.startLine > ref.line || (candidate.startLine === ref.line && candidate.startColumn > ref.column);
+  const letBound = LET_BOUND_KINDS.has(candidate.kind) || candidate.decorators?.[0] === 'let';
+  const ownBody = !below && letBound && containsPosition(candidate, ref.line, ref.column);
+  if (!below && !ownBody) return false;
+  const nodes = context.getNodesInFile(candidate.filePath);
+  const recursive = (n: Node): boolean => (n.kind === 'module' || n.kind === 'namespace') && n.decorators?.includes('rec') === true;
+  if (nodes.some((n) => recursive(n) && containsPosition(n, candidate.startLine, candidate.startColumn) && containsPosition(n, ref.line, ref.column))) {
+    return false;
+  }
+  if (ownBody && candidate.decorators?.includes('rec')) return false;
+  const groupStart = recursiveGroupStart(candidate.startLine, fileLines(candidate.filePath, context));
+  return groupStart === null || ref.line < groupStart;
+}
+
+/**
+ * The first line of the `let rec … and …` or `type … and …` group a declaration
+ * on `line` joins with `and`, or null when it joins none: its members are all
+ * in scope from the group's first line.
+ */
+function recursiveGroupStart(line: number, lines: readonly string[]): number | null {
+  const text = lines[line - 1] ?? '';
+  if (!/^\s*and\b/.test(text)) return null;
+  const indent = /^\s*/.exec(text)![0].length;
+  for (let at = line - 1; at >= 1; at--) {
+    const above = lines[at - 1] ?? '';
+    if (above.trim() === '') continue;
+    const depth = /^\s*/.exec(above)![0].length;
+    if (depth > indent) continue;
+    if (depth < indent) return null;
+    if (/^\s*and\b/.test(above)) continue;
+    // A `let` group is recursive only when written `let rec`; a `type` group always is.
+    if (/^\s*(?:\[<.*>\]\s*)?type\b/.test(above) || /^\s*(?:\[<.*>\]\s*)?let\s+(?:(?:inline|private|internal|public)\s+)*rec\b/.test(above)) return at;
+    if (/^\s*\[</.test(above)) continue;
+    return null;
+  }
+  return null;
+}
+
+function fileLines(filePath: string, context: ResolutionContext): string[] {
+  return context.getFileLines?.(filePath) ?? context.readFile(filePath)?.split(/\r?\n/) ?? [];
+}
+
+/** A project file's `<Compile Include>` items, in order, with `/` separators: what F# compiles, in the order it does. */
+export function fsprojCompileItems(text: string): string[] {
+  return [...text.matchAll(/<Compile\s+Include\s*=\s*"([^"*?]+)"/gi)].map((m) => m[1]!.replace(/\\/g, '/'));
+}
+
+/**
+ * The files outside the index that decide what F# names see, project-relative:
+ * the `.fsproj` files in the folders around each F# file (the compile order),
+ * and each `.fs` file's `.fsi` signature, there or not, so one that appears is
+ * seen too. A sync re-resolves F# — and the C# and VB.NET that name it — when
+ * what one of them says changes.
+ */
+export function fsharpConfigFiles(context: ResolutionContext): string[] {
+  const root = context.getProjectRoot();
+  const out = new Set<string>();
+  const seenDirs = new Set<string>();
+  // Listed afresh, not from the memo: a sync asks after files came or went.
+  for (const file of context.getAllFiles()) {
+    if (!/\.fsx?$/i.test(file)) continue;
+    if (/\.fs$/i.test(file)) out.add(`${file}i`);
+    for (let dir = path.posix.dirname(file); !seenDirs.has(dir); dir = path.posix.dirname(dir)) {
+      seenDirs.add(dir);
+      let entries: string[] = [];
+      try {
+        entries = fs.readdirSync(path.join(root, dir === '.' ? '' : dir));
+      } catch {
+        entries = [];
+      }
+      for (const e of entries) if (/\.fsproj$/i.test(e)) out.add(dir === '.' ? e : `${dir}/${e}`);
+      if (dir === '.' || dir === '/' || dir === '') break;
+    }
+  }
+  return [...out];
 }
 
 /** Whether `candidate`'s file comes after `ref`'s in the F# project that compiles both, so `ref` cannot see it. */
@@ -1136,14 +1448,18 @@ export function isFsharpCandidateInScope(
     if (ref.language === 'razor') return false;
     if (!DOTNET_REFERRERS.has(ref.language)) return true;
     if (!SYMBOL_REFERENCE_KINDS.has(ref.referenceKind) || NON_SYMBOL_KINDS.has(candidate.kind)) return true;
-    // What a signature file leaves out is private to its F# file.
-    if (isHiddenBySignature(candidate, context)) return false;
+    // What a signature file leaves out is private to its F# file, and what is `private` or
+    // `internal` to the F# assembly, no C# or VB.NET assembly can name.
+    if (isHiddenBySignature(candidate, context) || isAssemblyInternal(candidate, context)) return false;
     const target = dotnetTargetOf(candidate, context);
     // An instance member on a value is the value's type's: that is the C# or VB.NET
     // resolver's to know (`var o = new Order(…); o.Confirm()`), not the written name's.
     if (!target.isStatic && ref.referenceName.includes('.')) return true;
     const file = dotnetFileScopeOf(ref, context, dotnetScope);
-    return file !== null && isFsharpReachableFromDotnet(file, writtenDotnetName(ref, context), target);
+    if (file === null) return false;
+    const written = writtenDotnetName(ref, context);
+    const rank = dotnetLookupRank(file, written, target);
+    return rank !== null && !isShadowedByDotnet(rank, ref, file, written, context);
   }
   // A Razor component is not something F# names.
   if (candidate.language === 'razor') return false;
@@ -1159,6 +1475,7 @@ export function isFsharpCandidateInScope(
   if (candidate.language === 'fsharp' && candidate.filePath !== ref.filePath && isHiddenBySignature(candidate, context)) return false;
 
   const sameFile = candidate.filePath === ref.filePath;
+  if (sameFile && candidate.language === 'fsharp' && isNotYetInScope(candidate, ref, context)) return false;
   const refScope = scopeOfRef(ref, context);
 
   const scope = scopeOfCandidate(candidate, context);

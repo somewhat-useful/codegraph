@@ -1382,3 +1382,146 @@ public class Draw
     expect(edgesOf('Draw.cs', 'None', ['calls', 'references'])).toEqual(['Geo::Shape']);
   });
 });
+
+describe('F# reads a file top to bottom, picks an overload by its arguments, and C# and VB.NET bind by their own lookup', () => {
+  let dir = '';
+  let project: CodeGraph;
+
+  beforeAll(async () => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-fsharp-order-'));
+    const files: Record<string, string> = {
+      'Order.fs': `module Order
+let helper () = 1
+module Inner =
+    let run () = helper ()
+    let helper () = 2
+let rec isEven n = n = 0 || isOdd (n - 1)
+and isOdd n = n <> 0 && isEven (n - 1)
+module rec Both =
+    let first () = second ()
+    let second () = 1
+`,
+      'Shop.fs': `namespace Shop
+module Pricing =
+    let internal inner x = x
+    let discount x = x
+type Box() =
+    member this.Add(x: int) = x
+    member this.Add(x: string) = x
+    member this.Put(x: int) = x
+    member this.Put(x: int, y: int) = x + y
+module Use =
+    let one () =
+        let b = Box()
+        b.Add(1)
+    let text () =
+        let b = Box()
+        b.Add("s")
+    let pair () =
+        let b = Box()
+        b.Put(1, 2)
+module private Helpers =
+    let tidy x = x
+`,
+      'Shape.fs': `namespace Shop
+[<RequireQualifiedAccess>]
+type Shape = | Circle of float | Empty
+module UseShape =
+    let through () = Shape.Circle 1.0
+    let bare () = Circle 1.0
+`,
+      'Domain.fs': `namespace Shop.Domain
+module Pricing =
+    [<CompiledName("ApplyDiscount")>]
+    let discount x = x
+type Customer(name: string) =
+    member this.Name = name
+`,
+      'Global.fs': `namespace global
+module Util =
+    let helper () = 1
+`,
+      'App.fs': `module App
+open Util
+let run () = helper ()
+`,
+      'WebPricing.cs': 'namespace Shop.Web { public static class Pricing { public static int discount(int x) { return x; } } public class Customer { } }\n',
+      'Web.cs': `using Shop.Domain;
+namespace Shop.Web { class Page { void Render() { Pricing.discount(1); var c = new Customer(); } } }
+`,
+      'Other.cs': `using Shop.Domain;
+namespace Elsewhere { class Report { void Run() { Pricing.ApplyDiscount(1); var c = new Customer(); } void Closed() { Shop.Helpers.tidy(1); Shop.Pricing.inner(1); } } }
+`,
+      'Web.vb': `Imports Shop.Domain
+Namespace Shop.Web
+  Class VPage
+    Sub Render()
+      Pricing.discount(1)
+    End Sub
+  End Class
+End Namespace
+Namespace Elsewhere
+  Class VReport
+    Sub Run()
+      Pricing.applydiscount(1)
+    End Sub
+  End Class
+End Namespace
+`,
+    };
+    for (const [rel, content] of Object.entries(files)) fs.writeFileSync(path.join(dir, rel), content);
+    project = await CodeGraph.init(dir, { index: true });
+  });
+
+  afterAll(() => {
+    project?.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  const edgesOf = (file: string, name: string, kinds: string[] = ['calls']): string[] => {
+    const id = project.getNodesInFile(file).find((n) => n.name === name)!.id;
+    return project.getOutgoingEdgesFrom([id]).filter((e) => kinds.includes(e.kind)).map((e) => {
+      const t = project.getNode(e.target)!;
+      return `${t.language}:${t.qualifiedName}@${t.startLine}`;
+    });
+  };
+
+  it('binds a name to what is declared above it, not to a namesake declared below', () => {
+    expect(edgesOf('Order.fs', 'run')).toEqual(['fsharp:Order::helper@2']);
+  });
+
+  it('lets the bindings of one `let rec … and …` and the contents of a `module rec` see each other', () => {
+    expect(edgesOf('Order.fs', 'isEven')).toEqual(['fsharp:Order::isOdd@7']);
+    expect(edgesOf('Order.fs', 'isOdd')).toEqual(['fsharp:Order::isEven@6']);
+    expect(edgesOf('Order.fs', 'first')).toEqual(['fsharp:Order::Both::second@10']);
+  });
+
+  it('picks the overload the arguments fit: by a literal\'s type, and by how many are passed', () => {
+    expect(edgesOf('Shop.fs', 'one')).toEqual(['fsharp:Shop::Box::Add@6']);
+    expect(edgesOf('Shop.fs', 'text')).toEqual(['fsharp:Shop::Box::Add@7']);
+    expect(edgesOf('Shop.fs', 'pair')).toEqual(['fsharp:Shop::Box::Put@9']);
+  });
+
+  it('reaches a case of a `[<RequireQualifiedAccess>]` union only through its type', () => {
+    expect(edgesOf('Shape.fs', 'through')).toEqual(['fsharp:Shop::Shape::Circle@3']);
+    expect(edgesOf('Shape.fs', 'bare')).toEqual([]);
+  });
+
+  it('opens a module of `namespace global` by its name', () => {
+    expect(edgesOf('App.fs', 'run')).toEqual(['fsharp:global::Util::helper@3']);
+  });
+
+  it('lets a C# or VB.NET namesake in a namespace around the code win over F# reached through a using', () => {
+    expect(edgesOf('Web.cs', 'Render', ['calls', 'instantiates']).sort()).toEqual(['csharp:Shop.Web::Customer@1', 'csharp:Shop.Web::Pricing::discount@1']);
+    expect(edgesOf('Web.vb', 'Render')).not.toContain('fsharp:Shop.Domain::Pricing::discount@4');
+    expect(edgesOf('Other.cs', 'Run', ['calls', 'instantiates']).sort()).toEqual(['fsharp:Shop.Domain::Customer@5', 'fsharp:Shop.Domain::Pricing::discount@4']);
+  });
+
+  it('reaches a `[<CompiledName>]` from VB.NET in any case', () => {
+    expect(edgesOf('Web.vb', 'Run')).toEqual(['fsharp:Shop.Domain::Pricing::discount@4']);
+  });
+
+  it('never links C# to what F# keeps inside its assembly: a private module\'s contents, an internal binding', () => {
+    expect(edgesOf('Other.cs', 'Closed')).toEqual([]);
+  });
+});

@@ -92,7 +92,9 @@ A `.fs` file is F# unless it says otherwise:
 2. otherwise a GLSL line decides against it: `#version`, `#define`, `#ifdef`,
    `precision mediump float`, `uniform` / `varying` / `attribute` declarations,
    `layout(location = …)`, `in` / `out` declarations like `in vec2 uv;`,
-   `void main(`;
+   `void main(`, or a C-style function or variable that names its type first
+   (`vec3 shade(vec3 n, vec3 l) {`, `const float k = 0.5;`) — an include of
+   helper functions has nothing else;
 3. otherwise a Forth line does: a `\ ` comment at the start of a line, a colon
    definition (`: square dup * ;`, or `: name` with a later line closed by `;`),
    a stack comment (`( n -- f )`), `require x.fs`, a base switch alone on its

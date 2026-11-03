@@ -16,6 +16,7 @@ import {
   UnresolvedReference,
 } from '../types';
 import { getParser, detectLanguage, isLanguageSupported, isFileLevelOnlyLanguage } from './grammars';
+import { parserInput } from './parse-budget';
 import { NodeIdAllocator, getNodeText, getChildByField, getPrecedingDocstring, BUILTIN_TYPE_NAMES, namedArgCount } from './tree-sitter-helpers';
 import { FN_REF_SPECS, captureFnRefCandidates, goScopedFnRefScopes, type FnRefSpec, type FnRefCandidate } from './function-ref';
 import { isGeneratedFile, isMinifiedContent } from './generated-detection';
@@ -103,23 +104,6 @@ const ERLANG_MFA_CALLS = new Set([
   'rpc:call', 'rpc:cast', 'rpc:async_call',
   'erpc:call', 'erpc:cast',
 ]);
-
-/**
- * The source as the parser's input callback, in small chunks, for a grammar
- * that sets `parseInChunks`. Its external scanner asks for the column of nearly
- * every token, and each ask makes the wasm parser walk the string it was handed
- * from the start of its chunk: with the whole file as one chunk that is
- * quadratic, and parsing real F# takes 2.5 times as long as with 128-character
- * chunks.
- */
-function inChunks(source: string): (index: number) => string {
-  return (index) => {
-    let end = index + 128;
-    // A surrogate pair is never cut in two.
-    if (end < source.length && (source.charCodeAt(end - 1) & 0xfc00) === 0xd800) end++;
-    return source.slice(index, end);
-  };
-}
 
 /**
  * Extract the name from a node based on language
@@ -1043,7 +1027,7 @@ export class TreeSitterExtractor {
         if (preParsed !== this.source) this.sourceAsWritten = this.source;
         this.source = preParsed;
       }
-      this.tree = parser.parse(this.extractor?.parseInChunks ? inChunks(this.source) : this.source) ?? null;
+      this.tree = parser.parse(parserInput(this.source, this.language)) ?? null;
       if (!this.tree) {
         throw new Error('Parser returned null tree');
       }
