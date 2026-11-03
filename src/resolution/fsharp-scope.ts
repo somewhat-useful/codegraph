@@ -192,11 +192,19 @@ function openedPaths(
 
 const FSHARP_FILES = new WeakMap<ResolutionContext, string[]>();
 
-/** The project's indexed F# files, listed once per context: a project without any pays nothing for F#. */
+/**
+ * The project's indexed F# files — by the language each was indexed as, so a
+ * `codegraph.json` extension mapping counts — listed once per context: a
+ * project without any pays nothing for F#.
+ */
 function fsharpFiles(context: ResolutionContext): string[] {
   let files = FSHARP_FILES.get(context);
-  if (!files) FSHARP_FILES.set(context, (files = context.getAllFiles().filter((f) => /\.fsx?$/i.test(f))));
+  if (!files) FSHARP_FILES.set(context, (files = indexedFsharpFiles(context)));
   return files;
+}
+
+function indexedFsharpFiles(context: ResolutionContext): string[] {
+  return context.getNodesByKind('file').filter((n) => n.language === 'fsharp').map((n) => n.filePath);
 }
 
 /** Whether the project has F# code at all. */
@@ -907,6 +915,7 @@ export function clearFsharpScopeCaches(context: ResolutionContext): void {
   COMPILED_NAMES.delete(context);
   DOTNET_NAMESPACES.delete(context);
   ASSEMBLY_INTERNAL.delete(context);
+  PRIVATE_SCOPES.delete(context);
   FSHARP_FILES.delete(context);
   FILE_SCOPES.delete(context);
   DECLARED_NAMESPACES.delete(context);
@@ -1020,14 +1029,51 @@ function isShadowedByDotnet(rank: number, ref: UnresolvedRef, file: DotnetFileSc
   let nearest = DOTNET_SHADOWS.get(ref);
   if (nearest === undefined) {
     const name = ref.referenceName.slice(ref.referenceName.lastIndexOf('.') + 1);
-    const ranks = context.getNodesByLowerName(name.toLowerCase())
-      .filter((n) => DOTNET_REFERRERS.has(n.language) && !NON_SYMBOL_KINDS.has(n.kind))
-      .map((n) => dotnetLookupRank(file, written, dotnetDeclarationTarget(n, context)))
-      .filter((r): r is number => r !== null);
+    const namesakes = context.getNodesByLowerName(name.toLowerCase())
+      .filter((n) => DOTNET_REFERRERS.has(n.language) && !NON_SYMBOL_KINDS.has(n.kind));
+    const bare = !written.includes('.');
+    const enclosing = bare ? enclosingDotnetTypes(ref, context) : new Set<string>();
+    const ranks = namesakes.map((n): number | null => {
+      const owner = n.qualifiedName.slice(0, Math.max(0, n.qualifiedName.lastIndexOf('::')));
+      // A member or nested type of a type around the code, or of one it inherits, comes before any namespace.
+      if (bare && enclosing.has(n.language === 'vbnet' ? owner.toLowerCase() : owner)) return -1;
+      // A VB.NET `Module`'s members are seen bare wherever its namespace is.
+      const module = bare && n.language === 'vbnet' ? vbModuleNamespace(owner, context) : null;
+      if (module !== null) return dotnetLookupRank(file, written, { reachable: true, namespace: module, container: module, name: n.name, kind: 'class', isStatic: true });
+      return dotnetLookupRank(file, written, dotnetDeclarationTarget(n, context));
+    }).filter((r): r is number => r !== null);
     nearest = ranks.length > 0 ? Math.min(...ranks) : null;
     DOTNET_SHADOWS.set(ref, nearest);
   }
   return nearest !== null && nearest <= rank;
+}
+
+/** The C# and VB.NET types around a reference and those they inherit, by qualified name (VB.NET's lowercased). */
+function enclosingDotnetTypes(ref: UnresolvedRef, context: ResolutionContext): Set<string> {
+  const out = new Set<string>();
+  const from = context.getNodeById?.(ref.fromNodeId) ?? context.getNodesInFile(ref.filePath).find((n) => n.id === ref.fromNodeId);
+  if (!from) return out;
+  const key = (n: Node): string => (n.language === 'vbnet' ? n.qualifiedName.toLowerCase() : n.qualifiedName);
+  const visit = (type: Node, depth: number): void => {
+    if (out.has(key(type)) || depth > 8) return;
+    out.add(key(type));
+    for (const parent of context.getSupertypeNodes?.(type.id) ?? []) visit(parent, depth + 1);
+  };
+  const segments = from.qualifiedName.split('::');
+  for (let i = segments.length; i > 0; i--) {
+    const qualified = segments.slice(0, i).join('::');
+    for (const n of context.getNodesByQualifiedName(qualified)) {
+      if (n.filePath === ref.filePath && DOTNET_REFERRERS.has(n.language) && TYPE_KINDS.has(n.kind)) visit(n, 0);
+    }
+  }
+  return out;
+}
+
+/** The namespace of the VB.NET `Module` with qualified name `owner`, or null when `owner` is no `Module`. */
+function vbModuleNamespace(owner: string, context: ResolutionContext): string | null {
+  const module = context.getNodesByQualifiedName(owner).find((n) => n.language === 'vbnet' && n.kind === 'class' &&
+    /^\s*(?:(?:Public|Friend|Private|Partial)\s+)*Module\b/i.test(fileLines(n.filePath, context)[n.startLine - 1] ?? ''));
+  return module ? dotnetDeclarationTarget(module, context).namespace : null;
 }
 
 /** What each reference kind of a C# or VB.NET name can land on in F#: a call invokes, a construction builds. */
@@ -1144,19 +1190,27 @@ function literalFits(literal: string | null, param: string | null): number {
   return /^[a-z]/.test(simple) || Object.values(FSHARP_TYPE_ABBREVIATIONS).includes(type) ? -1 : 0;
 }
 
-/** Splits `a, (b, c), d` at its top-level commas. */
+/**
+ * Splits `a, (b, c), d` at its top-level commas. A `<` opens a generic argument
+ * list only right after a name (`Map<string, int>`) and its `>` closes it: the
+ * arrows, comparisons and pipes of a function type or a lambda (`int -> int`,
+ * `fun x -> x`, `a <> b`) bracket nothing.
+ */
 function splitTopLevel(text: string): string[] {
   const parts: string[] = [];
   let depth = 0;
+  let generic = 0;
   let quoted = false;
   let start = 0;
   for (let i = 0; i < text.length; i++) {
     const ch = text[i]!;
     if (ch === '"' && text[i - 1] !== '\\') quoted = !quoted;
     if (quoted) continue;
-    if ('([{<'.includes(ch)) depth++;
-    else if (')]}>'.includes(ch)) depth--;
-    else if (ch === ',' && depth === 0) {
+    if ('([{'.includes(ch)) depth++;
+    else if (')]}'.includes(ch)) depth--;
+    else if (ch === '<' && isNameChar(text[i - 1]) && text[i + 1] !== '-' && text[i + 1] !== '|') generic++;
+    else if (ch === '>' && generic > 0 && !'-|=:'.includes(text[i - 1] ?? '')) generic--;
+    else if (ch === ',' && depth === 0 && generic === 0) {
       parts.push(text.slice(start, i).trim());
       start = i + 1;
     }
@@ -1189,14 +1243,24 @@ function overloadsFitting(overloads: Node[], ref: UnresolvedRef, context: Resolu
     const group = leadingParenGroup((n.signature ?? '').trim());
     const params = group === null ? null : splitTopLevel(group);
     if (params === null) return { n, score: 0 };
-    if (params.length !== args.length) return { n, score: -1 };
+    // `?b: int` and `[<Optional>] b: int` may be left out; a `[<ParamArray>]` takes any number.
+    const optional = (p: string): boolean => p.startsWith('?') || /\[<[^\]]*\bOptional\b/.test(p);
+    const variadic = params.length > 0 && /\[<[^\]]*\bParamArray\b/.test(params[params.length - 1]!);
+    const required = params.filter((p) => !optional(p) && !(variadic && p === params[params.length - 1])).length;
+    if (args.length < required || (!variadic && args.length > params.length)) return { n, score: -1 };
     let score = 1;
-    for (let i = 0; i < args.length; i++) {
-      const colon = params[i]!.indexOf(':');
-      const fit = literalFits(literalType(args[i]!), colon < 0 ? null : params[i]!.slice(colon + 1));
+    for (let i = 0; i < args.length && i < params.length; i++) {
+      // A named argument (`b = 2`) fills its parameter by name, not by position.
+      if (/^[A-Za-z_]\w*\s*=[^=]/.test(args[i]!)) continue;
+      if (variadic && i === params.length - 1) break;
+      const param = params[i]!.replace(/^\[<[^\]]*>\]\s*/, '').replace(/^\?/, '');
+      const colon = param.indexOf(':');
+      const fit = literalFits(literalType(args[i]!), colon < 0 ? null : param.slice(colon + 1));
       if (fit < 0) return { n, score: -1 };
       score += fit;
     }
+    // Of overloads the call fits equally, F# prefers the one it fills without optional arguments left out.
+    if (args.length < params.length) score -= 0.5;
     return { n, score };
   });
   const best = Math.max(...scored.map((s) => s.score));
@@ -1309,6 +1373,34 @@ function compileOrderOf(file: string, context: ResolutionContext): Map<string, n
   }
 }
 
+const PRIVATE_SCOPES = new WeakMap<ResolutionContext, Map<string, { path: string; namespace: boolean }[]>>();
+
+/**
+ * Whether F#'s `private` lets code in `refContainer` (a dotted path) reach
+ * `candidate`. A `private` declaration is its enclosing scope's: code inside
+ * that module or type (one file, as neither spans files) or that namespace (in
+ * any file of it) sees it. The contents of a `private` module or type are
+ * private to where it is, as F# combines their access with it.
+ */
+function isPrivateAccessible(candidate: Node, ref: UnresolvedRef, refContainer: string, context: ResolutionContext): boolean {
+  let perContext = PRIVATE_SCOPES.get(context);
+  if (!perContext) PRIVATE_SCOPES.set(context, (perContext = new Map()));
+  let limits = perContext.get(candidate.id);
+  if (!limits) {
+    const nodes = context.getNodesInFile(candidate.filePath);
+    const scopes = fileScopeOf(candidate.filePath, context);
+    limits = [candidate, ...nodes.filter((n) => n.id !== candidate.id && TYPE_KINDS.has(n.kind) && containsPosition(n, candidate.startLine, candidate.startColumn))]
+      // A class's `let` is the classLet rule's (isFsharpCandidateReachable).
+      .filter((n) => n.visibility === 'private' && n.decorators?.[0] !== 'let')
+      .map((n) => {
+        const path = containerOfNode(n);
+        return { path, namespace: scopes.byPath.get(path)?.kind === 'namespace' };
+      });
+    perContext.set(candidate.id, limits);
+  }
+  return limits.every(({ path, namespace }) => isPathPrefix(path, refContainer) && (namespace || candidate.filePath === ref.filePath));
+}
+
 /** Kinds a `let` binds: in its own body only when written `let rec`. */
 const LET_BOUND_KINDS: ReadonlySet<string> = new Set(['function', 'variable', 'constant']);
 
@@ -1365,6 +1457,16 @@ function fileLines(filePath: string, context: ResolutionContext): string[] {
   return context.getFileLines?.(filePath) ?? context.readFile(filePath)?.split(/\r?\n/) ?? [];
 }
 
+/**
+ * The names an F# signature file mentions, sorted, comments left out: what
+ * decides which of its `.fs` file's declarations other files see
+ * (`isHiddenBySignature`). A comment or a reordering changes none of them.
+ */
+export function signatureNames(text: string): string[] {
+  const code = text.replace(/\(\*[\s\S]*?\*\)|\/\/[^\n]*/g, ' ');
+  return [...new Set(code.match(/``[^`]+``|[\p{L}_][\p{L}\p{N}_']*/gu) ?? [])].sort();
+}
+
 /** A project file's `<Compile Include>` items, in order, with `/` separators: what F# compiles, in the order it does. */
 export function fsprojCompileItems(text: string): string[] {
   return [...text.matchAll(/<Compile\s+Include\s*=\s*"([^"*?]+)"/gi)].map((m) => m[1]!.replace(/\\/g, '/'));
@@ -1382,8 +1484,7 @@ export function fsharpConfigFiles(context: ResolutionContext): string[] {
   const out = new Set<string>();
   const seenDirs = new Set<string>();
   // Listed afresh, not from the memo: a sync asks after files came or went.
-  for (const file of context.getAllFiles()) {
-    if (!/\.fsx?$/i.test(file)) continue;
+  for (const file of indexedFsharpFiles(context)) {
     if (/\.fs$/i.test(file)) out.add(`${file}i`);
     for (let dir = path.posix.dirname(file); !seenDirs.has(dir); dir = path.posix.dirname(dir)) {
       seenDirs.add(dir);
@@ -1409,30 +1510,29 @@ function isCompiledLater(candidate: Node, ref: UnresolvedRef, context: Resolutio
   return at !== undefined && candidateAt !== undefined && candidateAt > at;
 }
 
-const SIGNATURES = new WeakMap<ResolutionContext, Map<string, string | null>>();
+const SIGNATURES = new WeakMap<ResolutionContext, Map<string, Set<string> | null>>();
 
 /**
  * Whether a signature file hides `candidate` from other files: beside `X.fs`,
  * an `X.fsi` declares what the file shows, and what it leaves out is private to
  * the file. The signature is read as text (the grammar cannot parse one), so a
- * name it mentions anywhere counts as declared.
+ * name its code mentions anywhere counts as declared; one only in a comment does not.
  */
 function isHiddenBySignature(candidate: Node, context: ResolutionContext): boolean {
   if (!/\.fs$/i.test(candidate.filePath)) return false;
   let byFile = SIGNATURES.get(context);
   if (!byFile) SIGNATURES.set(context, (byFile = new Map()));
   const signaturePath = `${candidate.filePath}i`;
-  let text = byFile.get(signaturePath);
-  if (text === undefined) {
+  let names = byFile.get(signaturePath);
+  if (names === undefined) {
     try {
-      text = fs.readFileSync(path.join(context.getProjectRoot(), signaturePath), 'utf8');
+      names = new Set(signatureNames(fs.readFileSync(path.join(context.getProjectRoot(), signaturePath), 'utf8')).map((n) => n.replace(/^``|``$/g, '')));
     } catch {
-      text = null;
+      names = null;
     }
-    byFile.set(signaturePath, text);
+    byFile.set(signaturePath, names);
   }
-  if (text === null) return false;
-  return indexOfWord(text, candidate.name.replace(/^``|``$/g, ''), 0) < 0;
+  return names !== null && !names.has(candidate.name.replace(/^``|``$/g, ''));
 }
 
 /** Is `candidate` something `ref` can mean? Always true for refs and candidates F# has nothing to say about. */
@@ -1477,6 +1577,7 @@ export function isFsharpCandidateInScope(
   const sameFile = candidate.filePath === ref.filePath;
   if (sameFile && candidate.language === 'fsharp' && isNotYetInScope(candidate, ref, context)) return false;
   const refScope = scopeOfRef(ref, context);
+  if (candidate.language === 'fsharp' && !isPrivateAccessible(candidate, ref, refScope.container, context)) return false;
 
   const scope = scopeOfCandidate(candidate, context);
   // A C# or VB.NET declaration outside every namespace is global.

@@ -373,4 +373,29 @@ describe('a sync follows a module-config change (#2977)', () => {
     expect(stateOf(root, graph)).toEqual(full);
   }, 120_000);
 
+  it('an .fsi edit that changes no name it declares re-opens nothing', async () => {
+    const root = tempRoot();
+    write(root, { ...FSHARP_BEFORE, 'Util.fsi': 'module Util\n\nval helper : unit -> int\n' });
+    const graph = await index(root);
+    const reopen = vi.spyOn(ExtractionOrchestrator.prototype, 'resurrectResolutionEdgesTouching');
+    write(root, { 'Util.fsi': 'module Util\n\n/// The answer.\nval helper : unit -> int\n' });
+    await graph.sync();
+    expect(reopen).not.toHaveBeenCalled();
+    reopen.mockRestore();
+    expect(callTargets(graph, 'Use::run')).toEqual(['Util.fs::Util::helper']);
+  }, 120_000);
+
+  it('F# under an extension codegraph.json maps to it is followed like `.fs`', async () => {
+    const { root, graph, full } = await syncEdit({
+      'codegraph.json': JSON.stringify({ extensions: { '.fsl': 'fsharp' } }),
+      'App.fsproj': '<Project><ItemGroup><Compile Include="Util.fsl" /><Compile Include="Use.fsl" /></ItemGroup></Project>',
+      'Util.fsl': 'module Util\n\nlet helper () = 1\n',
+      'Use.fsl': 'module Use\n\nlet run () = Util.helper ()\n',
+    }, {
+      'App.fsproj': '<Project><ItemGroup><Compile Include="Use.fsl" /><Compile Include="Util.fsl" /></ItemGroup></Project>',
+    });
+    expect(callTargets(graph, 'Use::run')).toEqual([]);
+    expect(stateOf(root, graph)).toEqual(full);
+  }, 120_000);
+
 });

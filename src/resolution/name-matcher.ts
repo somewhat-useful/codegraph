@@ -2687,7 +2687,7 @@ function luaModuleFile(name: string, decl: Node, context: ResolutionContext): st
  * same holds for Java, C#, Swift, Scala and PHP members. (A Dart `_name` is
  * its library's, which can span several files: see isVisibleAcrossFiles.)
  */
-const PRIVATE_IS_FILE_LOCAL = new Set<string>(['kotlin', 'java', 'csharp', 'swift', 'scala', 'php', 'fsharp']);
+const PRIVATE_IS_FILE_LOCAL = new Set<string>(['kotlin', 'java', 'csharp', 'swift', 'scala', 'php']);
 
 /**
  * Whether a resolution lands on a Java record's implicit accessor from outside
@@ -4268,6 +4268,9 @@ export function isVisibleAcrossFiles(candidate: Node, ref: UnresolvedRef, contex
   if (lang === 'dart') {
     return candidate.visibility !== 'private' || (ref.language === 'dart' && dartPrivateVisible(ref.filePath, candidate.filePath, context));
   }
+  // An F# `private` is its enclosing module's, type's or namespace's — a namespace spans files —
+  // which isFsharpCandidateInScope, above, already decided.
+  if (lang === 'fsharp') return true;
   if (PRIVATE_IS_FILE_LOCAL.has(lang)) {
     // Only Kotlin's private type keeps its members in its file: a Scala
     // `private[pkg] class` (or one with a private constructor) is the package's,

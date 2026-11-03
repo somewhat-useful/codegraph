@@ -1525,3 +1525,111 @@ End Namespace
     expect(edgesOf('Other.cs', 'Closed')).toEqual([]);
   });
 });
+
+describe('F# overloads with function types and optional parameters, named arguments, types in expressions, and `private`', () => {
+  let dir = '';
+  let project: CodeGraph;
+
+  beforeAll(async () => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-fsharp-access-'));
+    const files: Record<string, string> = {
+      'M.fs': `module M
+let size = 3
+type IShape = abstract Area : float
+type Circle(r: float) =
+    interface IShape with member _.Area = r
+    member this.Scale(size: int) = size
+type Box() =
+    member this.Map(f: int -> int, y: int) = f y
+    member this.Map(f: int -> int) = f 0
+    member this.Opt(a: int, ?b: int) = a
+    member this.Opt(a: int64) = int a
+let named () = Circle(1.0).Scale(size = 2)
+let equality () = List.exists (fun x -> x = size) [1]
+let typeTest (o: obj) = match o with :? Circle as c -> 1 | _ -> 0
+let upcast' (c: Circle) = c :> IShape
+let typeOf () = typeof<Circle>
+let useMap () =
+    let b = Box()
+    b.Map((fun x -> x), 1)
+let useOpt () =
+    let b = Box()
+    b.Opt(1)
+`,
+      'A.fs': `namespace Shop
+type private Cache() =
+    member _.Get() = 1
+module private Helpers =
+    let tidy x = x
+`,
+      'B.fs': `namespace Shop
+module Use =
+    let cache () = Cache()
+    let tidy () = Helpers.tidy 1
+`,
+      'Other.fs': `namespace Elsewhere
+open Shop
+module Use =
+    let tidy () = Helpers.tidy 1
+`,
+      'Domain.fs': `namespace Shop.Domain
+type Customer(name: string) =
+    member this.Name = name
+module Pricing =
+    let discount x = x
+`,
+      'Web.cs': `using static Shop.Domain.Pricing;
+using Shop.Domain;
+namespace Web {
+  class Own { class Customer { } static int discount(int x) { return x; } void Run() { discount(1); var c = new Customer(); } }
+  class Plain { void Run() { discount(1); var c = new Customer(); } }
+}
+`,
+    };
+    for (const [rel, content] of Object.entries(files)) fs.writeFileSync(path.join(dir, rel), content);
+    project = await CodeGraph.init(dir, { index: true });
+  });
+
+  afterAll(() => {
+    project?.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  const edgesOf = (file: string, name: string, kinds: string[] = ['calls', 'instantiates', 'references'], owner?: string): string[] => {
+    const id = project.getNodesInFile(file).find((n) => n.name === name && (!owner || n.qualifiedName.includes(owner)))!.id;
+    return project.getOutgoingEdgesFrom([id]).filter((e) => kinds.includes(e.kind)).map((e) => {
+      const t = project.getNode(e.target)!;
+      return `${e.kind}:${t.language}:${t.qualifiedName}@${t.startLine}`;
+    }).sort();
+  };
+
+  it('splits arguments and parameters past the arrows of function types and lambdas', () => {
+    expect(edgesOf('M.fs', 'useMap', ['calls'])).toEqual(['calls:fsharp:M::Box::Map@8']);
+  });
+
+  it('lets a call leave an optional parameter out, and prefers the exact type then', () => {
+    expect(edgesOf('M.fs', 'useOpt', ['calls'])).toEqual(['calls:fsharp:M::Box::Opt@10']);
+  });
+
+  it('reads a named argument\'s label as the parameter it sets, and an equality handed to a function as a value', () => {
+    expect(edgesOf('M.fs', 'named', ['references'])).toEqual([]);
+    expect(edgesOf('M.fs', 'equality', ['references'])).toEqual(['references:fsharp:M::size@2']);
+  });
+
+  it('references the types of type tests, casts and `typeof`', () => {
+    expect(edgesOf('M.fs', 'typeTest', ['references'])).toEqual(['references:fsharp:M::Circle@4']);
+    expect(edgesOf('M.fs', 'upcast\'', ['references'])).toEqual(['references:fsharp:M::Circle@4', 'references:fsharp:M::IShape@3']);
+    expect(edgesOf('M.fs', 'typeOf', ['references'])).toEqual(['references:fsharp:M::Circle@4']);
+  });
+
+  it('keeps a namespace\'s `private` to that namespace, in any of its files, and no further', () => {
+    expect(edgesOf('B.fs', 'cache', ['instantiates'])).toEqual(['instantiates:fsharp:Shop::Cache@2']);
+    expect(edgesOf('B.fs', 'tidy', ['calls'])).toEqual(['calls:fsharp:Shop::Helpers::tidy@5']);
+    expect(edgesOf('Other.fs', 'tidy', ['calls'])).toEqual([]);
+  });
+
+  it('lets a C# type\'s own member or nested type win over what `using` and `using static` bring from F#', () => {
+    expect(edgesOf('Web.cs', 'Run', ['calls', 'instantiates'], 'Own')).toEqual(['calls:csharp:Web::Own::discount@4', 'instantiates:csharp:Web::Own::Customer@4']);
+    expect(edgesOf('Web.cs', 'Run', ['calls', 'instantiates'], 'Plain')).toEqual(['calls:fsharp:Shop.Domain::Pricing::discount@5', 'instantiates:fsharp:Shop.Domain::Customer@2']);
+  });
+});

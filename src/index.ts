@@ -1331,7 +1331,19 @@ export class CodeGraph {
           if (changed.length > 0) {
             this.resolver.resetModuleConfig();
             let reopened = 0;
-            for (const language of moduleConfigLanguages(changed)) reopened += this.orchestrator.resurrectResolutionEdgesForLanguage(language);
+            // An F# signature decides only what its own `.fs` shows: re-open the edges into that file, from
+            // F#, C# and VB.NET, and the parked references naming what it declares — not every reference.
+            const signatures = changed.filter((rel) => /\.fsi$/i.test(rel));
+            for (const language of moduleConfigLanguages(changed.filter((rel) => !/\.fsi$/i.test(rel)))) {
+              reopened += this.orchestrator.resurrectResolutionEdgesForLanguage(language);
+            }
+            for (const signature of signatures) {
+              const implementation = signature.slice(0, -1);
+              const declared = [...new Set(this.queries.getNodesByFile(implementation).map((n) => n.name))];
+              for (const language of ['fsharp', 'csharp', 'vbnet'] as const) {
+                reopened += this.orchestrator.resurrectResolutionEdgesTouching(language, { targetFiles: [implementation], sourceDirs: [], moduleLeaves: declared }).length;
+              }
+            }
             refreshSynthesis = true;
             this.queries.setMetadata('synthesis_pending', '1');
             if (process.env.CODEGRAPH_SYNTH_TIMINGS) {

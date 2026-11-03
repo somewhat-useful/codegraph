@@ -39,7 +39,7 @@ import { adoptProjectScans, readProjectScans, type ProjectScans } from './projec
 import { clearCppIncluderMemos } from './cpp-includers';
 import { clearCMacroRenames } from './c-macro-renames';
 import { isObjcDeclaredTypeRef, matchByExactName, matchDotnetNameIntoFsharp } from './name-matcher';
-import { fsharpConfigFiles, fsprojCompileItems, isFsharpCompiledName, matchFsharpRecordConstruction } from './fsharp-scope';
+import { fsharpConfigFiles, fsprojCompileItems, isFsharpCompiledName, matchFsharpRecordConstruction, signatureNames } from './fsharp-scope';
 import { clearCFeatureVariantMemos } from './c-feature-variants';
 import { clearAmbientModuleMemos, ambientModuleDeclarations } from './ambient-modules';
 import { matchShopifyThemeFile } from './shopify-themes';
@@ -318,7 +318,7 @@ function moduleConfigDigest(abs: string, projectRoot: string): string {
     : file === 'Cargo.toml' ? cargoManifestDigestText(abs)
     : file === 'compile_commands.json' ? (readCompileDbIncludeDirs(abs, projectRoot) ?? []).join('\n')
     : /\.fsproj$/i.test(file) ? fsprojCompileItems(readTextOrEmpty(abs)).join('\n')
-    : /\.fsi$/i.test(file) ? readTextOrEmpty(abs)
+    : /\.fsi$/i.test(file) ? signatureNames(readTextOrEmpty(abs)).join('\n')
     : aliasConfigFields(abs) ?? '';
   return createHash('sha256').update(read).digest('hex').slice(0, 16);
 }
@@ -352,8 +352,9 @@ export function changedModuleConfigs(was: ModuleConfigSnapshot, now: ModuleConfi
 /**
  * The languages whose imports a changed config file governs: the ES-module
  * family for a tsconfig / jsconfig, Go for a go.mod, Rust for a Cargo manifest,
- * C and C++ for a compile database, F# for an `.fsproj`'s compile order, and
- * F#, C# and VB.NET for an F# signature file.
+ * C and C++ for a compile database, and F# for an `.fsproj`'s compile order.
+ * An F# signature file governs only its own `.fs`: the sync re-opens what
+ * points there instead (see `CodeGraph.sync`).
  */
 export function moduleConfigLanguages(changed: readonly string[]): Set<Language> {
   const languages = new Set<Language>();
@@ -362,8 +363,6 @@ export function moduleConfigLanguages(changed: readonly string[]): Set<Language>
     else if (/(?:^|\/)Cargo\.toml$/.test(rel)) languages.add('rust');
     else if (/(?:^|\/)compile_commands\.json$/.test(rel)) for (const language of ['c', 'cpp'] as const) languages.add(language);
     else if (/\.fsproj$/i.test(rel)) languages.add('fsharp');
-    // A signature decides what C# and VB.NET can name in F#, too.
-    else if (/\.fsi$/i.test(rel)) for (const language of ['fsharp', 'csharp', 'vbnet'] as const) languages.add(language);
     else for (const language of ESM_IMPORT_LANGUAGES) languages.add(language);
   }
   return languages;

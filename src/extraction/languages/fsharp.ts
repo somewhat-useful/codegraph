@@ -364,6 +364,8 @@ function valueName(node: SyntaxNode, source: string): string | null {
   if (node.type !== 'long_identifier' && node.type !== 'long_identifier_or_op' && node.type !== 'dot_expression') return null;
   const parent = node.parent;
   if (!parent || parent.type === 'long_identifier_or_op') return null;
+  // `x.Scale(size = 2)`, `Form(Text = "x")`: a named argument's label is the parameter or property it sets.
+  if (parent.type === 'infix_expression' && parent.namedChild(0)?.equals(node) && isNamedArgument(parent, source)) return null;
   const isValue =
     (VALUE_PARENTS.has(parent.type) &&
       !(parent.type === 'application_expression' && parent.namedChild(0)?.equals(node)) &&
@@ -376,6 +378,29 @@ function valueName(node: SyntaxNode, source: string): string | null {
   const text = txt(node, source);
   if (text.includes('.')) return /^(?:``|\p{Lu})/u.test(text) && !/[([]/.test(text) ? lastSegment(text) : null;
   return node.type === 'dot_expression' ? null : unlessParameter(text, node, node, source);
+}
+
+/**
+ * Whether the infix `name = value` is a named argument of a method or
+ * constructor call rather than an equality test: it is one of the arguments
+ * (alone or in the tuple) of an application whose callee is a method or a type
+ * — `x.Scale(size = 2)`, `Form(Text = "x")` — which .NET names in PascalCase.
+ * Handed to a function (`f (a = b)`, `List.exists (x = y)`), it is a `bool`.
+ */
+function isNamedArgument(infix: SyntaxNode, source: string): boolean {
+  const op = infix.namedChildren.find((c) => c.type === 'infix_op');
+  if (!op || txt(op, source) !== '=') return false;
+  let arg: SyntaxNode = infix;
+  if (arg.parent?.type === 'tuple_expression') arg = arg.parent;
+  if (arg.parent?.type === 'paren_expression') arg = arg.parent;
+  const app = arg.parent;
+  if (app?.type !== 'application_expression' || app.namedChild(0)?.equals(arg)) return false;
+  const callee = app.namedChild(0);
+  if (!callee) return false;
+  const name = callee.type === 'dot_expression'
+    ? txt(callee.childForFieldName('field') ?? callee, source)
+    : txt(callee, source);
+  return /^(?:``)?\p{Lu}/u.test(lastSegment(name));
 }
 
 /**
@@ -495,8 +520,9 @@ function addTypeReferences(ctx: ExtractorContext, ownerId: string, root: SyntaxN
     const n = stack.pop()!;
     // `[<Fact>]` names an attribute, not a type the signature uses.
     if (n.type === 'attributes') continue;
-    if (n.type === 'simple_type' || n.type === 'generic_type') {
-      const name = typeRefName(n, ctx.source);
+    // A type test's type (`:? Circle`) is an `atomic_type` around the name.
+    if (n.type === 'simple_type' || n.type === 'generic_type' || (n.type === 'atomic_type' && n.namedChild(0)?.type === 'long_identifier')) {
+      const name = n.type === 'atomic_type' ? typeRefName(n.namedChild(0)!, ctx.source) : typeRefName(n, ctx.source);
       if (name && /^\p{Lu}/u.test(name) && !seen.has(name)) {
         seen.add(name);
         ctx.addUnresolvedReference({
@@ -545,6 +571,12 @@ function visitBody(ctx: ExtractorContext, body: SyntaxNode, ownerId: string): vo
         line: n.startPosition.row + 1,
         column: n.startPosition.column,
       });
+    }
+    // `:? Circle`, `c :> IShape`, `o :?> Circle`, `typeof<Circle>`: a type written in an expression is used there.
+    if (n.type === 'type_check_pattern') {
+      addTypeReferences(ctx, ownerId, n);
+    } else if (n.type === 'typecast_expression' || n.type === 'typed_expression') {
+      for (const c of n.namedChildren) if (isTypeNode(c) || c.type === 'types') addTypeReferences(ctx, ownerId, c);
     }
     const value = valueName(n, ctx.source);
     if (value) {
