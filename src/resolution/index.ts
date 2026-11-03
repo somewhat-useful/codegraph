@@ -39,6 +39,7 @@ import { adoptProjectScans, readProjectScans, type ProjectScans } from './projec
 import { clearCppIncluderMemos } from './cpp-includers';
 import { clearCMacroRenames } from './c-macro-renames';
 import { isObjcDeclaredTypeRef, matchByExactName, matchDotnetNameIntoFsharp } from './name-matcher';
+import { isFsharpCompiledName, matchFsharpRecordConstruction } from './fsharp-scope';
 import { clearCFeatureVariantMemos } from './c-feature-variants';
 import { clearAmbientModuleMemos, ambientModuleDeclarations } from './ambient-modules';
 import { matchShopifyThemeFile } from './shopify-themes';
@@ -1812,6 +1813,13 @@ export class ReferenceResolver {
     const rustBound = matchRustUseBoundName(ref, this.context);
     if (rustBound !== undefined) return this.gateLanguage(rustBound, ref);
 
+    // An F# record expression, recorded by its labels (`{Name;Email}`), builds the record type F#
+    // infers from them, or nothing: no declaration carries a name in braces, so the pre-filter
+    // below would drop it, and no strategy past it reads one.
+    if (ref.language === 'fsharp' && ref.referenceKind === 'instantiates' && ref.referenceName.startsWith('{')) {
+      return this.gateLanguage(matchFsharpRecordConstruction(ref, this.context), ref);
+    }
+
     // Fast pre-filter: skip if no symbol with this name exists anywhere
     // AND the name doesn't match a local import. The import escape is
     // necessary because re-export rename chains (`import { login }
@@ -1845,7 +1853,10 @@ export class ReferenceResolver {
       // calls `FormatPrice`, which the exact-name set never lists.
       (CASE_INSENSITIVE_LANGUAGES.has(ref.language) && this.hasAnyPossibleMatchIgnoringCase(existenceName)) ||
       this.matchesAnyImport(ref) ||
-      this.frameworksFor(ref.language).some((f) => f.claimsReference?.(ref.referenceName));
+      this.frameworksFor(ref.language).some((f) => f.claimsReference?.(ref.referenceName)) ||
+      // C# and VB.NET call an F# function by its `[<CompiledName>]`, which no node is named.
+      ((ref.language === 'csharp' || ref.language === 'vbnet') &&
+        isFsharpCompiledName(existenceName.slice(existenceName.lastIndexOf('.') + 1), this.context));
     if (this.profileStages) this.stageAdd('preFilter', ref, preFilterPass, tPre);
     if (!preFilterPass) {
       return this.gateLanguage(matchJsStoreBindingCall(ref, this.context), ref);

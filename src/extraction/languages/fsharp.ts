@@ -379,6 +379,33 @@ function valueName(node: SyntaxNode, source: string): string | null {
 }
 
 /**
+ * What a record expression builds, as the resolver reads it: `{Name;Email}`
+ * (the labels, the first with the type's path when written `{ Dom.Customer.Name
+ * = … }`), or `{c with Name}` for a copy of the value `c`. Null for anything
+ * else in braces (an anonymous record, a computation expression's body).
+ */
+function recordConstruction(node: SyntaxNode, source: string): string | null {
+  const block = node.childForFieldName('block') ?? node.namedChild(0);
+  if (!block) return null;
+  const labelsOf = (initializers: SyntaxNode | null): string[] =>
+    (initializers?.namedChildren ?? [])
+      .filter((c) => c.type === 'field_initializer')
+      .map((c) => (c.childForFieldName('field') ? txt(c.childForFieldName('field')!, source) : ''))
+      .filter((label) => label !== '');
+  if (block.type === 'field_initializers') {
+    const labels = labelsOf(block);
+    return labels.length > 0 ? `{${labels.join(';')}}` : null;
+  }
+  if (block.type === 'with_field_expression') {
+    const copied = block.namedChild(0);
+    const labels = labelsOf(block.childForFieldName('block'));
+    if (!copied || labels.length === 0 || !NAME_NODES.has(copied.type)) return null;
+    return `{${txt(copied, source)} with ${labels.join(';')}}`;
+  }
+  return null;
+}
+
+/**
  * Every name a value binding introduces: `let x, y = ...`, `let (a, b) = ...`
  * and `let { Name = n; Age = age } = ...` bind several. Falls back to the
  * single name `getDefnName` finds.
@@ -507,6 +534,17 @@ function visitBody(ctx: ExtractorContext, body: SyntaxNode, ownerId: string): vo
           column: piped.at.startPosition.column,
         });
       }
+    }
+    // `{ Name = n; Email = e }` builds the record type those labels belong to; `{ c with Name = … }` one of `c`'s type.
+    const record = n.type === 'brace_expression' ? recordConstruction(n, ctx.source) : null;
+    if (record) {
+      ctx.addUnresolvedReference({
+        fromNodeId: ownerId,
+        referenceName: record,
+        referenceKind: 'instantiates',
+        line: n.startPosition.row + 1,
+        column: n.startPosition.column,
+      });
     }
     const value = valueName(n, ctx.source);
     if (value) {
@@ -983,6 +1021,15 @@ function handleBinding(
   // The first binding sits where its `let` does; the ones joined by `and` where their own name does.
   const anchor = first ? defn : left;
   const created = ctx.createNode(isFunction ? kinds.function : kinds.value, symbolName, anchor, extra);
+  // `let (|Even|Odd|) n = …` defines the cases `Even` and `Odd`, which a `match` uses by name.
+  const activePattern = /^\(\|(.+)\|\)$/.exec(symbolName);
+  if (created && activePattern) {
+    ctx.pushScope(created.id);
+    for (const name of activePattern[1]!.split('|').map((c) => c.trim())) {
+      if (name !== '' && name !== '_') ctx.createNode('enum_member', name, left, { isExported: extra.isExported === true });
+    }
+    ctx.popScope();
+  }
   // A destructuring binding introduces several names, each initialised by the same body:
   // each depends on what it calls, so `codegraph_node y` of `let x, y = make ()` shows `make`.
   const introduced = [created, ...boundNames.slice(1).map((other) => ctx.createNode(kinds.value, other, anchor, extra))];

@@ -1066,3 +1066,111 @@ let viaType () = Box.Shape.Square 2.0
     expect(callsOf('U.fs', 'unknown')).toEqual([]);
   });
 });
+
+describe('F# names bound the way F# binds them', () => {
+  let dir = '';
+  let project: CodeGraph;
+
+  beforeAll(async () => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-fsharp-binding-'));
+    const files: Record<string, string> = {
+      'Lib.fs': `namespace Lib
+
+module Loose =
+    let pick x = x
+module Second =
+    let pick x = x * 10
+module Cases1 =
+    type A = | Done | Fail
+module Cases2 =
+    type B = | Done | Retry
+`,
+      'Shop.fs': `namespace Shop
+
+module Core =
+    let helper x = x
+`,
+      'Dom.fs': `module Dom
+
+type Customer = { Name: string; Email: string }
+type Vendor = { Name: string; Code: int }
+
+let (|Even|Odd|) n = if n % 2 = 0 then Even else Odd
+let (|Int|_|) (s: string) = None
+
+[<CompiledName("Calculate")>]
+let compute x = x
+`,
+      'App.fs': `module App
+
+open Lib.Loose
+open Lib.Second
+open Lib.Cases1
+open Lib.Cases2
+open Shop
+open Core
+open Dom
+
+let lastOpen () = pick 1
+let lastCase () = Done
+let partialOpen () = helper 1
+let mk n = { Name = n; Email = "" }
+let mkCode n = { Name = n; Code = 1 }
+let mkLatest n = { Name = n }
+let cp (c: Customer) = { c with Name = "x" }
+let qualified () = { Dom.Customer.Name = "y"; Email = "" }
+let classify n =
+    match n with
+    | Even -> "even"
+    | Odd -> "odd"
+let parse s =
+    match s with
+    | Int i -> i
+    | _ -> 0
+`,
+      'Web.cs': `public class Web
+{
+    public int Run(int x) { return Dom.Calculate(x); }
+}
+`,
+    };
+    for (const [rel, content] of Object.entries(files)) fs.writeFileSync(path.join(dir, rel), content);
+    project = await CodeGraph.init(dir, { index: true });
+  });
+
+  afterAll(() => {
+    project?.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  const edgesOf = (file: string, name: string, kind: string): string[] => {
+    const id = project.getNodesInFile(file).find((n) => n.name === name)!.id;
+    return project.getOutgoingEdgesFrom([id]).filter((e) => e.kind === kind).map((e) => project.getNode(e.target)!.qualifiedName);
+  };
+
+  it('takes what the later `open` brings in, for a function and for a union case', () => {
+    expect(edgesOf('App.fs', 'lastOpen', 'calls')).toEqual(['Lib::Second::pick']);
+    expect(edgesOf('App.fs', 'lastCase', 'references')).toEqual(['Lib::Cases2::B::Done']);
+  });
+
+  it('reads an `open` of a module relative to a namespace opened before it', () => {
+    expect(edgesOf('App.fs', 'partialOpen', 'calls')).toEqual(['Shop::Core::helper']);
+  });
+
+  it('builds the record type F# infers from the labels, the latest declared one when several have them', () => {
+    expect(edgesOf('App.fs', 'mk', 'instantiates')).toEqual(['Dom::Customer']);
+    expect(edgesOf('App.fs', 'mkCode', 'instantiates')).toEqual(['Dom::Vendor']);
+    expect(edgesOf('App.fs', 'mkLatest', 'instantiates')).toEqual(['Dom::Vendor']);
+    expect(edgesOf('App.fs', 'cp', 'instantiates')).toEqual(['Dom::Customer']);
+    expect(edgesOf('App.fs', 'qualified', 'instantiates')).toEqual(['Dom::Customer']);
+  });
+
+  it('links an active pattern\'s cases where a match uses them', () => {
+    expect(edgesOf('App.fs', 'classify', 'references').sort()).toEqual(['Dom::(|Even|Odd|)::Even', 'Dom::(|Even|Odd|)::Odd']);
+    expect(edgesOf('App.fs', 'parse', 'references')).toEqual(['Dom::(|Int|_|)::Int']);
+  });
+
+  it('links a C# call by a `[<CompiledName>]` no F# name resembles', () => {
+    expect(edgesOf('Web.cs', 'Run', 'calls')).toEqual(['Dom::compute']);
+  });
+});

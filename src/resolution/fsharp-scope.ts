@@ -150,6 +150,25 @@ function namesContainer(qualifier: string): boolean {
   return /^(?:``|\p{Lu})/u.test(qualifier);
 }
 
+/**
+ * The full paths a file's `open`s, in order, can name: each read relative to the
+ * scopes around the reference, and to what the `open`s before it opened —
+ * `open Shop` then `open Core` opens the module `Shop.Core` (F# refuses that
+ * for a namespace, FS0893, so code that compiles names a module there).
+ */
+function openedPaths(prefixes: readonly string[], opens: readonly { name: string; line: number }[]): { path: string; line: number }[] {
+  const out: { path: string; line: number }[] = [];
+  const bases = new Set<string>(prefixes);
+  for (const { name, line } of opens) {
+    const reached = [...bases].map((base) => joinPath(base, name));
+    for (const path of reached) {
+      out.push({ path, line });
+      bases.add(path);
+    }
+  }
+  return out;
+}
+
 const RESOLVED_SCOPES = new WeakMap<FsharpRefScope, { prefixes: string[]; opens: Set<string> }>();
 
 /** The scopes around a reference and its opens, the latter also read relative to those scopes (`open Core` in `namespace Shop`). */
@@ -158,7 +177,7 @@ function resolvedScopes(ref: FsharpRefScope): { prefixes: string[]; opens: Set<s
   if (cached) return cached;
   const prefixes = scopePrefixes(ref.container);
   const opens = new Set<string>();
-  for (const o of ref.opens) for (const p of prefixes) opens.add(joinPath(p, o));
+  for (const { path } of openedPaths(prefixes, ref.opens.map((name) => ({ name, line: 0 })))) opens.add(path);
   const resolved = { prefixes, opens };
   RESOLVED_SCOPES.set(ref, resolved);
   return resolved;
@@ -632,6 +651,11 @@ function compiledNameOf(node: Node): string | null {
 
 const COMPILED_NAMES = new WeakMap<ResolutionContext, Map<string, Node[]>>();
 
+/** Whether some F# declaration is compiled under `name` by a `[<CompiledName>]` that differs from its F# name. */
+export function isFsharpCompiledName(name: string, context: ResolutionContext): boolean {
+  return compiledNamed(name, context).length > 0;
+}
+
 /** F# declarations whose `[<CompiledName>]` is `name`, which a lookup by their F# name does not find. */
 function compiledNamed(name: string, context: ResolutionContext): Node[] {
   let byName = COMPILED_NAMES.get(context);
@@ -824,12 +848,9 @@ export function latestFsharpBindings(candidates: Node[], ref: UnresolvedRef, con
   const file = fileScopeOf(ref.filePath, context);
   // Where each path became visible through an `open` read relative to the scopes around the reference.
   const openedAt = new Map<string, number>();
-  for (const entry of file.opens) {
-    if (!importApplies(entry, ref)) continue;
-    for (const prefix of scopePrefixes(scope.container)) {
-      const path = joinPath(prefix, entry.node.name);
-      openedAt.set(path, Math.max(openedAt.get(path) ?? -1, entry.node.endLine));
-    }
+  const applying = file.opens.filter((entry) => importApplies(entry, ref)).map(({ node }) => ({ name: node.name, line: node.endLine }));
+  for (const { path, line } of openedPaths(scopePrefixes(scope.container), applying)) {
+    openedAt.set(path, Math.max(openedAt.get(path) ?? -1, line));
   }
   const visibleFrom = (path: string, declaredAt: number, sameFile: boolean): number => {
     if (path === '' || path === GLOBAL_NAMESPACE) return 0;
@@ -848,7 +869,56 @@ export function latestFsharpBindings(candidates: Node[], ref: UnresolvedRef, con
     return target.container.endsWith(`.${qualifier}`) ? visibleFrom(head, n.startLine, sameFile) : -1;
   });
   const latest = Math.max(...lines);
-  return candidates.filter((_, i) => lines[i] === latest);
+  const visible = candidates.filter((_, i) => lines[i] === latest);
+  // Declared side by side, as one module or namespace's in one file: the later declaration shadows the earlier.
+  const holder = (n: Node): string => `${n.filePath}|${scopeOfCandidate(n, context).holders[0] ?? ''}`;
+  if (visible.length > 1 && visible.every((n) => holder(n) === holder(visible[0]!))) {
+    const last = Math.max(...visible.map((n) => n.startLine));
+    return visible.filter((n) => n.startLine === last);
+  }
+  return visible;
+}
+
+/**
+ * The record type an F# record expression builds, as F# infers it from the
+ * labels: `{Name;Email}` (the extractor's spelling of `{ Name = n; Email = e }`)
+ * is a record type in scope with those fields — the one that became visible
+ * last when several have them — and `{ Dom.Customer.Name = … }` the type its
+ * first label is written through. `{c with Name}` copies `c`, so it builds `c`'s
+ * type. Null unless exactly one type is meant.
+ */
+export function matchFsharpRecordConstruction(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
+  const written = /^\{(.+)\}$/.exec(ref.referenceName);
+  if (ref.language !== 'fsharp' || ref.referenceKind !== 'instantiates' || !written) return null;
+  const scope = scopeOfRef(ref, context);
+  const copy = /^(\S+) with (.+)$/.exec(written[1]!);
+  const labels = (copy ? copy[2]! : written[1]!).split(';');
+  let types: Node[];
+  if (copy) {
+    const from = context.getNodeById?.(ref.fromNodeId) ?? undefined;
+    const valueType = copy[1]!.includes('.') ? pathValueType(copy[1]!, scope, context) : localValueType(copy[1]!, ref, from, context);
+    if (!valueType) return null;
+    types = valueType.kind === 'path'
+      ? context.getNodesByQualifiedName(valueType.path.split('.').join('::')).filter((n) => TYPE_KINDS.has(n.kind))
+      : reachableTypes(valueType.name, scope, context);
+  } else if (labels[0]!.includes('.')) {
+    const first = labels[0]!;
+    labels[0] = lastSegmentOf(first);
+    types = reachableTypes(first.slice(0, first.length - labels[0].length - 1), scope, context);
+  } else {
+    // The types with a field of the first label, among those the reference can name.
+    const owners = new Set(context.getNodesByName(labels[0]!)
+      .filter((n) => n.language === 'fsharp' && n.kind === 'field')
+      .map((n) => n.qualifiedName.slice(0, n.qualifiedName.lastIndexOf('::'))));
+    types = [...owners].flatMap((qn) => context.getNodesByQualifiedName(qn))
+      .filter((t) => t.language === 'fsharp' && TYPE_KINDS.has(t.kind) && t.kind !== 'module' &&
+        isFsharpCandidateReachable({ ...scope, qualifiers: [], receivers: null }, scopeOfCandidate(t, context)));
+  }
+  const hasField = (type: Node, label: string): boolean =>
+    context.getNodesByName(label).some((f) => f.kind === 'field' && f.qualifiedName === `${type.qualifiedName}::${label}`);
+  const built = latestFsharpBindings(types.filter((t) => labels.every((label) => hasField(t, label))), { ...ref, referenceName: '' }, context);
+  if (built.length === 0 || built.some((t) => t.qualifiedName !== built[0]!.qualifiedName)) return null;
+  return { original: ref, targetNodeId: built[0]!.id, confidence: 0.9, resolvedBy: 'exact-match' };
 }
 
 /** Is `candidate` something `ref` can mean? Always true for refs and candidates F# has nothing to say about. */
