@@ -553,7 +553,8 @@ exception Boom of string
         'union Types::Shape',
         'enum_member Types::Shape::Circle',
         'enum_member Types::Shape::Rect',
-        'struct Types::Order',
+        // A record is a class; `[<Struct>]` makes one a struct.
+        'class Types::Order',
         'field Types::Order::Id',
         'field Types::Order::Name',
         'enum Types::Color',
@@ -733,14 +734,66 @@ let total (o: Order) (rate: Rate) : Money = Money 0
     expect(total.signature).toBe('(o: Order) (rate: Rate) : Money');
   });
 
-  it('should make a symbol the implementer of an object expression interface', () => {
+  it('should read an object expression as an anonymous class that implements the interface', () => {
     const code = ['module M', '', 'let make () =', '    { new IDisposable with', '        member _.Dispose() = cleanup () }', ''].join(String.fromCharCode(10));
     const result = extractFromSource('M.fs', code);
     const make = result.nodes.find((n) => n.name === 'make')!;
+    const anon = result.nodes.find((n) => n.name === '<IDisposable$anon@4>')!;
+    const dispose = result.nodes.find((n) => n.name === 'Dispose')!;
+    const from = (id: string, kind: string) =>
+      result.unresolvedReferences.filter((r) => r.referenceKind === kind && r.fromNodeId === id).map((r) => r.referenceName);
 
-    expect(
-      result.unresolvedReferences.filter((r) => r.referenceKind === 'implements' && r.fromNodeId === make.id).map((r) => r.referenceName)
-    ).toEqual(['IDisposable']);
+    expect(anon.kind).toBe('class');
+    // The class is declared inside the function that builds it.
+    expect(dispose.qualifiedName).toBe('M::make::<IDisposable$anon@4>::Dispose');
+    // The object implements the interface; the function builds it; the member does what the member does.
+    expect(from(anon.id, 'implements')).toEqual(['IDisposable']);
+    expect(from(make.id, 'implements')).toEqual([]);
+    expect(from(make.id, 'instantiates')).toEqual(['IDisposable']);
+    expect(from(dispose.id, 'calls')).toEqual(['cleanup']);
+    expect(from(make.id, 'calls')).toEqual([]);
+  });
+
+  it('should read an object expression over a class as extending it, its arguments evaluated where it is built', () => {
+    const code = ['module M', '', 'let make () = { new Base(seed ()) with override _.Speak() = "x" }', ''].join(String.fromCharCode(10));
+    const result = extractFromSource('M.fs', code);
+    const make = result.nodes.find((n) => n.name === 'make')!;
+    const anon = result.nodes.find((n) => n.name.startsWith('<Base$anon'))!;
+    const from = (id: string, kind: string) =>
+      result.unresolvedReferences.filter((r) => r.referenceKind === kind && r.fromNodeId === id).map((r) => r.referenceName);
+
+    expect(from(anon.id, 'extends')).toEqual(['Base']);
+    expect(from(make.id, 'calls')).toEqual(['seed']);
+  });
+
+  it('should read the kinds F# gives its types and members', () => {
+    const code = [
+      'module M',
+      '',
+      '[<Struct>]',
+      'type P = { X: int }',
+      'type H = delegate of int -> unit',
+      'type I =',
+      '    abstract Run : unit -> unit',
+      '    abstract Two : int * int -> int',
+      '    abstract OnChange : (int -> unit)',
+      'type B() =',
+      '    abstract Speak : unit -> string',
+      '    default _.Speak() = "base"',
+      '',
+    ].join(String.fromCharCode(10));
+    const result = extractFromSource('M.fs', code);
+    const kind = (qn: string) => result.nodes.filter((n) => n.qualifiedName === qn).map((n) => n.kind);
+
+    expect(kind('M::P')).toEqual(['struct']);
+    expect(kind('M::H')).toEqual(['class']);
+    expect(result.nodes.find((n) => n.qualifiedName === 'M::H')?.decorators).toContain('delegate');
+    expect(kind('M::I::Run')).toEqual(['method']);
+    expect(kind('M::I::Two')).toEqual(['method']);
+    // A function-typed property: the arrow is inside the parentheses.
+    expect(kind('M::I::OnChange')).toEqual(['property']);
+    // `abstract` with its `default` is one virtual member.
+    expect(kind('M::B::Speak')).toEqual(['method']);
   });
 
   it('should extract the bindings and types joined by `and`', () => {
@@ -759,7 +812,7 @@ let total (o: Order) (rate: Rate) : Money = Money 0
     const result = extractFromSource('Rec.fs', code);
 
     expect(kindsAndNames(result)).toEqual(
-      expect.arrayContaining(['function Rec::even', 'function Rec::odd', 'struct Rec::A', 'struct Rec::B', 'class Rec::C'])
+      expect.arrayContaining(['function Rec::even', 'function Rec::odd', 'class Rec::A', 'class Rec::B', 'class Rec::C'])
     );
     // The body of `odd` is odd's own: it calls `even`, not the other way round.
     const odd = result.nodes.find((n) => n.name === 'odd')!;
@@ -817,7 +870,8 @@ let total (o: Order) (rate: Rate) : Money = Money 0
 
     expect(test.kind).toBe('function');
     expect(test.decorators).toContain('Fact');
-    expect(result.nodes.find((n) => n.name === 'K')?.kind).toBe('variable');
+    // `[<Literal>]` makes a compile-time constant.
+    expect(result.nodes.find((n) => n.name === 'K')?.kind).toBe('constant');
     // An attribute is not a type the signature uses.
     expect(refs(result, 'references')).toEqual([]);
     expect(refs(result, 'calls')).toEqual(['helper']);
@@ -876,7 +930,7 @@ let total (o: Order) (rate: Rate) : Money = Money 0
 
   it('should name `namespace rec` by its path, not by the keyword', () => {
     const result = extractFromSource('M.fs', ['namespace rec Shop.Core', '', 'type A = { X: int }', ''].join(String.fromCharCode(10)));
-    expect(kindsAndNames(result)).toEqual(expect.arrayContaining(['namespace Shop.Core', 'struct Shop.Core::A']));
+    expect(kindsAndNames(result)).toEqual(expect.arrayContaining(['namespace Shop.Core', 'class Shop.Core::A']));
   });
 
   it('should read a lambda binding as a function and keep signatures on one line', () => {

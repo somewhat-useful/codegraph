@@ -519,7 +519,7 @@ function addTypeReferences(ctx: ExtractorContext, ownerId: string, root: SyntaxN
  * enclosing symbol an implementer of IDisposable.
  */
 function visitBody(ctx: ExtractorContext, body: SyntaxNode, ownerId: string): void {
-  ctx.visitFunctionBody(body, ownerId);
+  walkCalls(ctx, body, ownerId);
   const stack: SyntaxNode[] = [body];
   while (stack.length > 0) {
     const n = stack.pop()!;
@@ -556,12 +556,69 @@ function visitBody(ctx: ExtractorContext, body: SyntaxNode, ownerId: string): vo
         column: n.startPosition.column,
       });
     }
-    if (n.type === 'object_expression') {
-      const iface = n.namedChild(0);
-      if (iface && (NAME_NODES.has(iface.type) || isTypeNode(iface))) addTypeRef(ctx, ownerId, iface, 'implements');
-    }
+    // An object expression is a class of its own (`objectExpression`): what its members do is theirs.
+    if (n.type === 'object_expression') continue;
     for (const c of n.namedChildren) stack.push(c);
   }
+}
+
+/**
+ * The calls of a body, by the shared body walker — except inside an object
+ * expression, which is a class of its own: `{ new IGreeter with member _.Greet n
+ * = helper n }` does not call `helper` where it is written, its `Greet` does.
+ * On the way down to one, each node's own call is read as the walker reads it.
+ */
+function walkCalls(ctx: ExtractorContext, node: SyntaxNode, ownerId: string): void {
+  if (node.type === 'object_expression') {
+    objectExpression(ctx, node, ownerId);
+    return;
+  }
+  if (node.descendantsOfType('object_expression').length === 0) {
+    ctx.visitFunctionBody(node, ownerId);
+    return;
+  }
+  const callee = fsharpExtractor.extractBareCall?.(node, ctx.source);
+  if (callee) {
+    ctx.addUnresolvedReference({
+      fromNodeId: ownerId,
+      referenceName: callee,
+      referenceKind: 'calls',
+      line: node.startPosition.row + 1,
+      column: node.startPosition.column,
+    });
+  }
+  for (const child of node.namedChildren) walkCalls(ctx, child, ownerId);
+}
+
+/**
+ * `{ new IGreeter with member _.Greet n = … }` and `{ new Base(1) with override
+ * … }`: an anonymous class, `<IGreeter$anon@line>` as Java's and Kotlin's are,
+ * implementing the interface (or, with constructor arguments, extending the
+ * class), with its members and any further `interface … with` of its own. The
+ * code around it builds one, as `new T() { … }` does.
+ */
+function objectExpression(ctx: ExtractorContext, node: SyntaxNode, ownerId: string): void {
+  const head = node.namedChild(0);
+  if (!head) return;
+  const constructed = head.type === 'application_expression' ? head.namedChild(0) : null;
+  const typeNode = constructed ?? head;
+  const name = typeRefName(typeNode, ctx.source) ?? lastSegment(txt(typeNode, ctx.source).replace(/<.*$/, ''));
+  if (!name) return;
+  ctx.addUnresolvedReference({
+    fromNodeId: ownerId,
+    referenceName: name,
+    referenceKind: 'instantiates',
+    line: typeNode.startPosition.row + 1,
+    column: typeNode.startPosition.column,
+  });
+  // The base class's constructor arguments are evaluated where the object is built.
+  if (constructed) for (const arg of head.namedChildren.slice(1)) visitBody(ctx, arg, ownerId);
+  const anon = ctx.createNode('class', `<${name}$anon@${node.startPosition.row + 1}>`, node, {});
+  if (!anon) return;
+  addTypeRef(ctx, anon.id, typeNode, constructed ? 'extends' : 'implements');
+  ctx.pushScope(anon.id);
+  for (const child of node.namedChildren.slice(1)) visitTypeElement(child, ctx, anon.id);
+  ctx.popScope();
 }
 
 /** `a +++ b` calls the project's `(+++)` when the operator is not a standard one. */
@@ -754,14 +811,45 @@ function handleMemberDefn(node: SyntaxNode, ctx: ExtractorContext): void {
       if (argsText || retText) signature = `${argsText ? `(${argsText})` : '()'}${retText ? ` : ${retText}` : ''}`;
     }
 
-    // `abstract Name : int` and `abstract Name : int with get, set` are properties; only an arrow makes a method.
-    const abstractNode = ctx.createNode(txt(inner, source).includes('->') ? 'method' : 'property', symbolName, node, {
+    // `abstract Name : int` and `abstract Name : int with get, set` are properties; an arrow makes a method,
+    // unless it sits in parentheses: `abstract OnChange : (int -> unit)` is a property of a function type.
+    const isMethod = curried !== null && (childOfTypes(curried, 'arguments_spec') !== null || /->/.test(outsideParens(txt(curried, source))));
+    // `abstract M` with a `default M` beside it is one virtual member, which the `default` declares.
+    if (hasDefaultBeside(node, symbolName, source)) return;
+    const abstractNode = ctx.createNode(isMethod ? 'method' : 'property', symbolName, node, {
       signature,
       isAbstract: true,
       isExported: true,
     });
     if (abstractNode && curried) addTypeReferences(ctx, abstractNode.id, curried);
   }
+}
+
+/** The text with every parenthesised part taken out: `(int -> unit)` has no arrow left. */
+function outsideParens(text: string): string {
+  let out = '';
+  let depth = 0;
+  for (const ch of text) {
+    if (ch === '(') depth++;
+    else if (ch === ')') depth = Math.max(0, depth - 1);
+    else if (depth === 0) out += ch;
+  }
+  return out;
+}
+
+/** Whether the type body around an `abstract` member also has a `default` of that name. */
+function hasDefaultBeside(memberDefn: SyntaxNode, name: string, source: string): boolean {
+  let body = memberDefn.parent;
+  while (body && body.type === 'type_extension_elements') body = body.parent;
+  if (!body) return false;
+  return body.descendantsOfType('member_defn').some((m) => {
+    if (m.equals(memberDefn)) return false;
+    const inner = m.namedChildren.find((c) => c.type === 'method_or_prop_defn');
+    if (!inner || !/\bdefault\b/.test(source.slice(m.startIndex, inner.startIndex))) return false;
+    const nameNode = inner.childForFieldName('name');
+    const own = nameNode?.childForFieldName('method') ?? nameNode?.namedChild(0) ?? null;
+    return (own ? txt(own, source) : nameNode ? lastSegment(txt(nameNode, source)) : '') === name;
+  });
 }
 
 /**
@@ -807,7 +895,8 @@ function handleTypeDefn(
       kind = 'union';
       break;
     case 'record_type_defn':
-      kind = 'struct';
+      // A record is a class unless `[<Struct>]` makes it a value type.
+      kind = attributeList.some((a) => /^Struct(?:Attribute)?$/.test(a)) ? 'struct' : 'class';
       break;
     case 'enum_type_defn':
       kind = 'enum';
@@ -816,8 +905,11 @@ function handleTypeDefn(
       kind = 'type_alias';
       break;
     case 'interface_type_defn':
-    case 'delegate_type_defn':
       kind = 'interface';
+      break;
+    case 'delegate_type_defn':
+      // A .NET delegate type is a sealed class, marked as a delegate below.
+      kind = 'class';
       break;
     default:
       kind = isInterface ? 'interface' : isStructKeyword ? 'struct' : 'class';
@@ -827,6 +919,7 @@ function handleTypeDefn(
   const decorators = [...attributeList];
   // `type System.String with ...` extends a type declared elsewhere.
   if (defnNode.type === 'type_extension') decorators.push('extension');
+  if (defnNode.type === 'delegate_type_defn') decorators.push('delegate');
   // The first type of an `and` chain is positioned by the whole chain but ends with its own definition.
   const extra: Record<string, unknown> = {
     isExported: access !== 'private',
@@ -1020,7 +1113,9 @@ function handleBinding(
 
   // The first binding sits where its `let` does; the ones joined by `and` where their own name does.
   const anchor = first ? defn : left;
-  const created = ctx.createNode(isFunction ? kinds.function : kinds.value, symbolName, anchor, extra);
+  // `[<Literal>] let Limit = 10` is a compile-time constant.
+  const isLiteral = !isFunction && decorators.some((d) => /^Literal(?:Attribute)?$/.test(d));
+  const created = ctx.createNode(isFunction ? kinds.function : isLiteral && !classLocal ? 'constant' : kinds.value, symbolName, anchor, extra);
   // `let (|Even|Odd|) n = …` defines the cases `Even` and `Odd`, which a `match` uses by name.
   const activePattern = /^\(\|(.+)\|\)$/.exec(symbolName);
   if (created && activePattern) {
