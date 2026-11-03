@@ -101,6 +101,8 @@ export interface FsharpCandidateScope {
   holders: readonly string[];
   /** The `[<AutoOpen>]` modules among the scopes around it. */
   autoOpened: readonly string[];
+  /** A class's `let` binding: in scope bare inside its type, where the type's members are not. */
+  classLet?: boolean;
 }
 
 /**
@@ -180,9 +182,12 @@ export function isFsharpCandidateReachable(ref: FsharpRefScope, candidate: Fshar
     path === '' || path === GLOBAL_NAMESPACE || prefixes.includes(path) || opens.has(path) || (candidate.autoOpened.includes(path) && exposed(parentPath(path)));
   const viaContainer = ref.qualifiers.filter(namesContainer);
   if (viaContainer.length > 0) {
-    const through = (q: string): boolean =>
-      c === q || (c.endsWith(`.${q}`) && exposed(c.slice(0, c.length - q.length - 1)));
-    if (viaContainer.some(through)) return true;
+    const through = (path: string, q: string): boolean =>
+      path === q || (path.endsWith(`.${q}`) && exposed(path.slice(0, path.length - q.length - 1)));
+    // A union case is written through its type (`Shape.Circle`) or through the module or
+    // namespace its type is declared in (`Box.Circle`): its holders.
+    const paths = candidate.kind === 'enum_member' ? [c, ...candidate.holders] : [c];
+    if (viaContainer.some((q) => paths.some((path) => through(path, q)))) return true;
   }
   if (ref.externalQualifier) return false;
 
@@ -193,9 +198,10 @@ export function isFsharpCandidateReachable(ref: FsharpRefScope, candidate: Fshar
 
   if (ref.qualifiers.length > 0) return false;
 
-  // Bare name: a member is never in scope; anything else only through an
-  // enclosing scope or an opened one.
-  if (isMember) return sameFile && isPathPrefix(c, ref.container);
+  // Bare name: a member is never in scope — inside its own type too, where it is reached
+  // through the self identifier (`this.M`) — but a class's `let` is, inside that type;
+  // anything else only through an enclosing scope or an opened one.
+  if (isMember) return candidate.classLet === true && sameFile && isPathPrefix(c, ref.container);
   return candidate.holders.some((h) => opens.has(h) || isPathPrefix(h, ref.container));
 }
 
@@ -746,6 +752,7 @@ function scopeOfCandidate(candidate: Node, context: ResolutionContext): FsharpCa
     kind: candidate.kind,
     holders: foreign ? [container] : holdersOf(candidate, file),
     autoOpened: foreign ? [] : autoOpenedAround(candidate, file.scopes),
+    classLet: !foreign && candidate.decorators?.[0] === 'let',
   };
   perContext.set(candidate.id, scope);
   return scope;

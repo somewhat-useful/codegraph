@@ -959,7 +959,8 @@ function handleBinding(
   const keywords = leadingKeywords(source.slice((first ? defn : left).startIndex, (nameAt ?? left).startIndex));
   // A class's `let` is always private to it, whatever is written.
   const access = classLocal ? 'private' : (accessOf(left, source) ?? (patternHolder ? accessOf(patternHolder, source) : undefined));
-  const decorators: string[] = [...keywords];
+  // A class's `let` is marked so: it, and not the type's members, is in scope bare inside the type.
+  const decorators: string[] = classLocal ? ['let', ...keywords] : [...keywords];
   const attrs = first && defn.parent ? childOfTypes(defn.parent, 'attributes') : null;
   decorators.push(...attributeNames(attrs, source), ...attributeNames(patternHolder ? childOfTypes(patternHolder, 'attributes') : null, source));
 

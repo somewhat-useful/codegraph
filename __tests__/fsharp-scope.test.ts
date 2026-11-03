@@ -99,11 +99,13 @@ describe('isFsharpCandidateReachable', () => {
     expect(isFsharpCandidateReachable(ref({ opens: ['Ns'], qualifiers: ['LogEventType'] }), error)).toBe(true);
   });
 
-  it('reaches a type member bare only from inside its type, in its file', () => {
-    const own = candidate('M.T', { kind: 'method' });
+  it('reaches a class `let` bare only from inside its type, and a member never', () => {
+    const own = candidate('M.T', { kind: 'method', classLet: true });
     expect(isFsharpCandidateReachable(ref({ container: 'M.T' }), own, true)).toBe(true);
     expect(isFsharpCandidateReachable(ref({ container: 'M.Other' }), own, true)).toBe(false);
     expect(isFsharpCandidateReachable(ref({ container: 'M.T' }), own, false)).toBe(false);
+    // A member is reached through the self identifier (`this.M`), inside its own type too.
+    expect(isFsharpCandidateReachable(ref({ container: 'M.T' }), candidate('M.T', { kind: 'method' }), true)).toBe(false);
   });
 
   it('never reaches anything through a path the project does not declare', () => {
@@ -1002,6 +1004,29 @@ let inherited (r: Repo) = r.Save()
 let unknown r = r.Add(3)
 `,
     };
+    files['Util.fs'] = `module Util
+
+let format x = string x
+`;
+    files['Box.fs'] = `module Box
+
+open Util
+
+type Box(v: int) =
+    let describe () = "box"
+    member this.format() = "box"
+    member this.Show() = format v
+    member this.Name() = describe ()
+
+type Shape =
+    | Circle of float
+    | Square of float
+`;
+    files['UseBox.fs'] = `module UseBox
+
+let viaModule () = Box.Circle 1.0
+let viaType () = Box.Shape.Square 2.0
+`;
     for (const [rel, content] of Object.entries(files)) fs.writeFileSync(path.join(dir, rel), content);
     project = await CodeGraph.init(dir, { index: true });
   });
@@ -1009,6 +1034,16 @@ let unknown r = r.Add(3)
   afterAll(() => {
     project?.close();
     fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('reads a bare name inside a type as F# does: a class `let` or an opened function, never a member', () => {
+    expect(callsOf('Box.fs', 'Show')).toEqual(['Util::format']);
+    expect(callsOf('Box.fs', 'Name')).toEqual(['Box::Box::describe']);
+  });
+
+  it('links a union case written through the module its type is declared in, or through the type', () => {
+    expect(callsOf('UseBox.fs', 'viaModule')).toEqual(['Box::Shape::Circle']);
+    expect(callsOf('UseBox.fs', 'viaType')).toEqual(['Box::Shape::Square']);
   });
 
   const callsOf = (file: string, name: string): string[] => {
