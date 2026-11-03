@@ -32752,17 +32752,18 @@ function matchReferenceInner(
     return nmTimed('storeAccessorChain', ref, () => matchStoreAccessorChain(ref, context));
   }
 
-  // 2. Method call pattern
-  result = nmTimed('methodCall', ref, () => matchMethodCall(ref, context));
-  if (result) return result;
-
-  // 2b. A C# name of an F# declaration: an F# module is a static class to C#,
-  // its functions no class's methods, so the strategies above never find them.
-  // After C#'s own lookup, so a C# namesake wins.
+  // 2. A C# name of an F# declaration: an F# module is a static class to C#,
+  // its functions no class's methods, and an F# base class's members are the
+  // C# type's own, which the strategies below never find. C#'s lookup order,
+  // across both languages, decides it — a C# namesake nearer the code wins.
   if (ref.language === 'csharp') {
     result = nmTimed('dotnetToFsharp', ref, () => matchDotnetNameIntoFsharp(ref, context));
     if (result) return result;
   }
+
+  // 2b. Method call pattern
+  result = nmTimed('methodCall', ref, () => matchMethodCall(ref, context));
+  if (result) return result;
 
   // 3. Exact name match
   result = nmTimed('exactName', ref, () => matchByExactName(ref, context));

@@ -1663,3 +1663,54 @@ type Svc() as self =
     expect(callsOf('Run')).toEqual(['Use::Svc::Go']);
   });
 });
+
+describe('C# deriving from an F# class', () => {
+  let dir = '';
+  let project: CodeGraph;
+
+  beforeAll(async () => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-fsharp-derive-'));
+    fs.writeFileSync(path.join(dir, 'Handler.fs'), `namespace Shop
+
+type Handler() =
+    member _.Confirm() = ()
+    static member Shared() = 1
+`);
+    fs.writeFileSync(path.join(dir, 'MyHandler.cs'), `using Shop;
+namespace Web {
+  class MyHandler : Handler {
+    void Bare() { Confirm(); }
+    void ViaThis() { this.Confirm(); }
+    void ViaBase() { base.Confirm(); }
+    void Static() { Shared(); }
+  }
+  class Own : Handler {
+    void Confirm() { }
+    void Bare() { Confirm(); }
+  }
+}
+`);
+    project = await CodeGraph.init(dir, { index: true });
+  });
+
+  afterAll(() => {
+    project?.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  const callsOf = (owner: string, name: string): string[] => {
+    const id = project.getNodesInFile('MyHandler.cs').find((n) => n.name === name && n.qualifiedName.includes(owner))!.id;
+    return project.getOutgoingEdgesFrom([id]).filter((e) => e.kind === 'calls').map((e) => project.getNode(e.target)!.qualifiedName);
+  };
+
+  it('reaches the members it inherits from F#, bare and through `this` and `base`, static ones too', () => {
+    expect(callsOf('MyHandler', 'Bare')).toEqual(['Shop::Handler::Confirm']);
+    expect(callsOf('MyHandler', 'ViaThis')).toEqual(['Shop::Handler::Confirm']);
+    expect(callsOf('MyHandler', 'ViaBase')).toEqual(['Shop::Handler::Confirm']);
+    expect(callsOf('MyHandler', 'Static')).toEqual(['Shop::Handler::Shared']);
+  });
+
+  it('lets its own member hide the inherited one', () => {
+    expect(callsOf('Own', 'Bare')).toEqual(['Web::Own::Confirm']);
+  });
+});

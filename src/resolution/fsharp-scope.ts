@@ -1019,28 +1019,46 @@ const DOTNET_SHADOWS = new WeakMap<UnresolvedRef, number | null>();
  * `Shop.Web.Customer` before F#'s `Shop.Domain.Customer`, and two equally near
  * are an ambiguity no compiling code has.
  */
-function isShadowedByDotnet(rank: number, ref: UnresolvedRef, file: DotnetFileScope, written: string, context: ResolutionContext): boolean {
+function isShadowedByDotnet(rank: number, ref: UnresolvedRef, file: DotnetFileScope, context: ResolutionContext): boolean {
   let nearest = DOTNET_SHADOWS.get(ref);
   if (nearest === undefined) {
     const name = ref.referenceName.slice(ref.referenceName.lastIndexOf('.') + 1);
-    const namesakes = context.getNodesByName(name).filter((n) => DOTNET_REFERRERS.has(n.language) && !NON_SYMBOL_KINDS.has(n.kind));
-    const bare = !written.includes('.');
-    const enclosing = bare ? enclosingDotnetTypes(ref, context) : new Set<string>();
-    const ranks = namesakes.map((n): number | null => {
-      const owner = n.qualifiedName.slice(0, Math.max(0, n.qualifiedName.lastIndexOf('::')));
-      // A member or nested type of a type around the code, or of one it inherits, comes before any namespace.
-      if (bare && enclosing.has(owner)) return -1;
-      return dotnetLookupRank(file, written, dotnetDeclarationTarget(n, context));
-    }).filter((r): r is number => r !== null);
+    const ranks = context.getNodesByName(name)
+      .filter((n) => DOTNET_REFERRERS.has(n.language) && !NON_SYMBOL_KINDS.has(n.kind))
+      .map((n) => dotnetRank(ref, file, n, dotnetDeclarationTarget(n, context), context))
+      .filter((r): r is number => r !== null);
     nearest = ranks.length > 0 ? Math.min(...ranks) : null;
     DOTNET_SHADOWS.set(ref, nearest);
   }
   return nearest !== null && nearest <= rank;
 }
 
-/** The C# types around a reference and those they inherit, by qualified name. */
+/**
+ * How near C#'s lookup finds `node` — F#'s or C#'s, as `target` names it —
+ * for the name `ref` writes. A member or nested type of the type the code is
+ * written in, or of a type that one inherits, comes first (-1): written bare,
+ * or through `this.` / `base.`, static or not, as C# looks a simple name up in
+ * the enclosing types before any namespace. Then `dotnetLookupRank`.
+ */
+function dotnetRank(ref: UnresolvedRef, file: DotnetFileScope, node: Node, target: DotnetTarget, context: ResolutionContext): number | null {
+  const written = ref.referenceName;
+  const own = /^(?:this|base)\.([^.]+)$/.exec(written);
+  if (own || !written.includes('.')) {
+    const owner = node.qualifiedName.slice(0, Math.max(0, node.qualifiedName.lastIndexOf('::')));
+    if (target.name === (own ? own[1] : written) && enclosingDotnetTypes(ref, context).has(owner)) return -1;
+    if (own) return null;
+  }
+  return dotnetLookupRank(file, written, target);
+}
+
+const ENCLOSING_DOTNET_TYPES = new WeakMap<UnresolvedRef, Set<string>>();
+
+/** The C# types around a reference and those they inherit, F#'s included, by qualified name. */
 function enclosingDotnetTypes(ref: UnresolvedRef, context: ResolutionContext): Set<string> {
+  const cached = ENCLOSING_DOTNET_TYPES.get(ref);
+  if (cached) return cached;
   const out = new Set<string>();
+  ENCLOSING_DOTNET_TYPES.set(ref, out);
   const from = context.getNodeById?.(ref.fromNodeId) ?? context.getNodesInFile(ref.filePath).find((n) => n.id === ref.fromNodeId);
   if (!from) return out;
   const visit = (type: Node, depth: number): void => {
@@ -1084,15 +1102,14 @@ export function matchDotnetNameInFsharp(ref: UnresolvedRef, context: ResolutionC
   if (declared.length === 0) return null;
   const file = dotnetFileScopeOf(ref, context, read);
   if (!file) return null;
-  const written = ref.referenceName;
   // The nearest in C#'s lookup order; overloads of one member share a qualified name, two different declarations are a guess.
   const ranked = declared
-    .map((n) => ({ n, rank: dotnetLookupRank(file, written, dotnetTargetOf(n, context)) }))
+    .map((n) => ({ n, rank: dotnetRank(ref, file, n, dotnetTargetOf(n, context), context) }))
     .filter((r): r is { n: Node; rank: number } => r.rank !== null);
   if (ranked.length === 0) return null;
   const best = Math.min(...ranked.map((r) => r.rank));
   // A C# declaration the lookup finds as near or nearer is what the name means.
-  if (isShadowedByDotnet(best, ref, file, written, context)) return null;
+  if (isShadowedByDotnet(best, ref, file, context)) return null;
   const reached = ranked.filter((r) => r.rank === best).map((r) => r.n);
   if (reached.some((n) => n.qualifiedName !== reached[0]!.qualifiedName)) return null;
   return { original: ref, targetNodeId: reached[0]!.id, confidence: 0.9, resolvedBy: 'qualified-name' };
@@ -1593,12 +1610,12 @@ export function isFsharpCandidateInScope(
     const target = dotnetTargetOf(candidate, context);
     // An instance member on a value is the value's type's: that is the C#
     // resolver's to know (`var o = new Order(…); o.Confirm()`), not the written name's.
-    if (!target.isStatic && ref.referenceName.includes('.')) return true;
+    // `this.M` and `base.M` are the enclosing type's, which C#'s lookup decides here.
+    if (!target.isStatic && ref.referenceName.includes('.') && !/^(?:this|base)\./.test(ref.referenceName)) return true;
     const file = dotnetFileScopeOf(ref, context, dotnetScope);
     if (file === null) return false;
-    const written = ref.referenceName;
-    const rank = dotnetLookupRank(file, written, target);
-    return rank !== null && !isShadowedByDotnet(rank, ref, file, written, context);
+    const rank = dotnetRank(ref, file, candidate, target, context);
+    return rank !== null && !isShadowedByDotnet(rank, ref, file, context);
   }
   // A Razor component is not something F# names.
   if (candidate.language === 'razor') return false;
