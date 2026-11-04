@@ -39,6 +39,7 @@ import { adoptProjectScans, readProjectScans, type ProjectScans } from './projec
 import { clearCppIncluderMemos } from './cpp-includers';
 import { clearCMacroRenames } from './c-macro-renames';
 import { isObjcDeclaredTypeRef, matchByExactName } from './name-matcher';
+import { fsharpConfigFiles, fsprojCompileItems, isFsharpCompiledName, isFsharpSymbolReference, matchFsharpReference, signatureNames } from './fsharp-scope';
 import { clearCFeatureVariantMemos } from './c-feature-variants';
 import { clearAmbientModuleMemos, ambientModuleDeclarations } from './ambient-modules';
 import { matchShopifyThemeFile } from './shopify-themes';
@@ -316,8 +317,18 @@ function moduleConfigDigest(abs: string, projectRoot: string): string {
   const read = file === 'go.mod' ? loadGoModule(path.dirname(abs))?.modulePath ?? ''
     : file === 'Cargo.toml' ? cargoManifestDigestText(abs)
     : file === 'compile_commands.json' ? (readCompileDbIncludeDirs(abs, projectRoot) ?? []).join('\n')
+    : /\.fsproj$/i.test(file) ? fsprojCompileItems(readTextOrEmpty(abs)).join('\n')
+    : /\.fsi$/i.test(file) ? signatureNames(readTextOrEmpty(abs)).join('\n')
     : aliasConfigFields(abs) ?? '';
   return createHash('sha256').update(read).digest('hex').slice(0, 16);
+}
+
+function readTextOrEmpty(abs: string): string {
+  try {
+    return fs.readFileSync(abs, 'utf-8');
+  } catch {
+    return '';
+  }
 }
 
 function cargoManifestDigestText(abs: string): string {
@@ -341,7 +352,9 @@ export function changedModuleConfigs(was: ModuleConfigSnapshot, now: ModuleConfi
 /**
  * The languages whose imports a changed config file governs: the ES-module
  * family for a tsconfig / jsconfig, Go for a go.mod, Rust for a Cargo manifest,
- * C and C++ for a compile database.
+ * C and C++ for a compile database, and F# for an `.fsproj`'s compile order.
+ * An F# signature file governs only its own `.fs`: the sync re-opens what
+ * points there instead (see `CodeGraph.sync`).
  */
 export function moduleConfigLanguages(changed: readonly string[]): Set<Language> {
   const languages = new Set<Language>();
@@ -349,6 +362,7 @@ export function moduleConfigLanguages(changed: readonly string[]): Set<Language>
     if (/(?:^|\/)go\.mod$/.test(rel)) languages.add('go');
     else if (/(?:^|\/)Cargo\.toml$/.test(rel)) languages.add('rust');
     else if (/(?:^|\/)compile_commands\.json$/.test(rel)) for (const language of ['c', 'cpp'] as const) languages.add(language);
+    else if (/\.fsproj$/i.test(rel)) languages.add('fsharp');
     else for (const language of ESM_IMPORT_LANGUAGES) languages.add(language);
   }
   return languages;
@@ -1057,6 +1071,8 @@ export class ReferenceResolver {
       getAllFiles: () => {
         return this.queries.getAllFilePaths();
       },
+
+      getFilePathsOfLanguage: (language) => this.queries.getFilePathsOfLanguage(language),
 
       listDirectories: (relativePath: string) => {
         const target = relativePath === '.' || relativePath === ''
@@ -1812,6 +1828,11 @@ export class ReferenceResolver {
     const rustBound = matchRustUseBoundName(ref, this.context);
     if (rustBound !== undefined) return this.gateLanguage(rustBound, ref);
 
+    // An F# name means what F#'s lookup says it does (see matchFsharpReference): the name as
+    // the extractor read it from the tree (where it is written, what it is written on) by F#'s scope rules, and
+    // no strategy past here guesses beyond that.
+    if (isFsharpSymbolReference(ref)) return this.gateLanguage(matchFsharpReference(ref, this.context), ref);
+
     // Fast pre-filter: skip if no symbol with this name exists anywhere
     // AND the name doesn't match a local import. The import escape is
     // necessary because re-export rename chains (`import { login }
@@ -1845,7 +1866,10 @@ export class ReferenceResolver {
       // calls `FormatPrice`, which the exact-name set never lists.
       (CASE_INSENSITIVE_LANGUAGES.has(ref.language) && this.hasAnyPossibleMatchIgnoringCase(existenceName)) ||
       this.matchesAnyImport(ref) ||
-      this.frameworksFor(ref.language).some((f) => f.claimsReference?.(ref.referenceName));
+      this.frameworksFor(ref.language).some((f) => f.claimsReference?.(ref.referenceName)) ||
+      // C# calls an F# function by its `[<CompiledName>]`, which no node is named.
+      (ref.language === 'csharp' &&
+        isFsharpCompiledName(existenceName.slice(existenceName.lastIndexOf('.') + 1), this.context));
     if (this.profileStages) this.stageAdd('preFilter', ref, preFilterPass, tPre);
     if (!preFilterPass) {
       return this.gateLanguage(matchJsStoreBindingCall(ref, this.context), ref);
@@ -3305,6 +3329,7 @@ export class ReferenceResolver {
     }
     const files = new Set<string>(this.moduleConfigFiles);
     for (const name of MODULE_CONFIG_ROOT_FILES) files.add(path.join(this.projectRoot, name));
+    for (const rel of fsharpConfigFiles(this.context)) files.add(path.join(this.projectRoot, rel));
     for (const rel of Object.keys(was)) files.add(path.join(this.projectRoot, rel));
     return moduleConfigSnapshot(this.projectRoot, files, was);
   }

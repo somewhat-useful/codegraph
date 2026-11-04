@@ -28,6 +28,7 @@ import { leavesWorkspaceRoot } from './workspace-packages';
 import { isMinifiedContent } from '../extraction/generated-detection';
 import { getCargoWorkspaceCrateMap, parsePackageName, parseTargetPaths, parseWorkspaceMembers } from './frameworks/cargo-workspace';
 import { blankRustCode, readRustScopes, rustBindingAt, rustInnerBlockAt, rustBoundsOf, rustFnAt, rustImplAt, splitRustTopLevel, type RustBinding, type RustPatternSite, type RustScopes } from './rust-scopes';
+import { isFsharpCandidateInScope, clearFsharpScopeCaches, matchDotnetNameInFsharp, type DotnetFileScope } from './fsharp-scope';
 /**
  * Ceiling on how many same-named definitions a FUZZY name-match strategy will
  * score. A name defined more times than this is "ubiquitous" — a method/symbol
@@ -167,7 +168,7 @@ const LANGUAGE_FAMILY: Record<string, string> = {
   c: 'native', cpp: 'native',
   // Razor/Blazor markup names C# types — same family so `@model Foo` /
   // `<MyComponent/>` resolve to their `.cs` class through the cross-family gate.
-  csharp: 'dotnet', razor: 'dotnet', vbnet: 'dotnet',
+  csharp: 'dotnet', razor: 'dotnet', vbnet: 'dotnet', fsharp: 'dotnet',
   svelte: 'web', vue: 'web', astro: 'web',
   cfml: 'cfml', cfscript: 'cfml',
 };
@@ -4198,6 +4199,9 @@ export function isVisibleAcrossFiles(candidate: Node, ref: UnresolvedRef, contex
   if (ref.language === 'go' && candidate.language === 'go' &&
       (isGoExternalQualified(ref, context) || !isInGoQualifierPackage(candidate, ref, context))) return false;
   if ((ref.language === 'csharp' || ref.language === 'razor') && !csharpTypeArityFits(candidate, ref, context)) return false;
+  // An F# name is its file's above it, its enclosing namespace or module's, or an opened one's — in
+  // its own file too, which F# reads top to bottom.
+  if (!isFsharpCandidateInScope(candidate, ref, context, dotnetScopeForFsharp)) return false;
   if (candidate.filePath === ref.filePath) return true;
   // A vendored minified bundle's names are mangled: healthchecks' 369 `$(…)`
   // (jQuery, a global) went to a one-letter helper inside bootstrap-native.min.js.
@@ -4264,6 +4268,9 @@ export function isVisibleAcrossFiles(candidate: Node, ref: UnresolvedRef, contex
   if (lang === 'dart') {
     return candidate.visibility !== 'private' || (ref.language === 'dart' && dartPrivateVisible(ref.filePath, candidate.filePath, context));
   }
+  // An F# `private` is its enclosing module's, type's or namespace's — a namespace spans files —
+  // which isFsharpCandidateInScope, above, already decided.
+  if (lang === 'fsharp') return true;
   if (PRIVATE_IS_FILE_LOCAL.has(lang)) {
     // Only Kotlin's private type keeps its members in its file: a Scala
     // `private[pkg] class` (or one with a private constructor) is the package's,
@@ -7972,23 +7979,40 @@ function csharpSupertypesOf(typeName: string, context: ResolutionContext): strin
 }
 
 /**
- * The types a C# file sees through static usings: its own `using static
- * A.B.Type;`, any file's `global using static`, and `<Using Include="A.B.Type"
- * Static="true"/>` in the `.csproj` / `Directory.Build.props` files above it
- * (AutoMapper imports its ExpressionBuilder helpers project-wide that way).
+ * The types a C# file sees through static usings, by simple name (see
+ * `csharpStaticUsingPaths`).
  */
 function csharpStaticUsings(file: string, context: ResolutionContext): Set<string> {
   let memo = CSHARP_STATIC_USINGS.get(context);
   if (!memo) CSHARP_STATIC_USINGS.set(context, (memo = new Map()));
   const hit = memo.get(file);
   if (hit) return hit;
-  const owners = new Set<string>(csharpProjectStaticUsings(path.posix.dirname(file), context, memo));
-  for (const m of (context.readFile(file) ?? '').matchAll(/^\s*(?:global\s+)?using\s+static\s+([\w.]+)\s*;/gm)) owners.add(m[1]!.split('.').pop()!);
+  const owners = new Set([...csharpStaticUsingPaths(file, context)].map((full) => full.split('.').pop()!));
   memo.set(file, owners);
   return owners;
 }
 
-/** Static usings that apply to every file under `dir`: project files on the way up, and every `global using static`. */
+const CSHARP_STATIC_USING_PATHS = new WeakMap<ResolutionContext, Map<string, Set<string>>>();
+
+/**
+ * The types a C# file sees through static usings, by full path: its own
+ * `using static A.B.Type;`, any file's `global using static`, and `<Using
+ * Include="A.B.Type" Static="true"/>` in the `.csproj` / `Directory.Build.props`
+ * files above it (AutoMapper imports its ExpressionBuilder helpers project-wide
+ * that way).
+ */
+function csharpStaticUsingPaths(file: string, context: ResolutionContext): Set<string> {
+  let memo = CSHARP_STATIC_USING_PATHS.get(context);
+  if (!memo) CSHARP_STATIC_USING_PATHS.set(context, (memo = new Map()));
+  const hit = memo.get(file);
+  if (hit) return hit;
+  const owners = new Set<string>(csharpProjectStaticUsings(path.posix.dirname(file), context, memo));
+  for (const m of (context.readFile(file) ?? '').matchAll(/^\s*(?:global\s+)?using\s+static\s+(?:global::)?([\w.]+)\s*;/gm)) owners.add(m[1]!);
+  memo.set(file, owners);
+  return owners;
+}
+
+/** Static usings, by full path, that apply to every file under `dir`: project files on the way up, and every `global using static`. */
 function csharpProjectStaticUsings(dir: string, context: ResolutionContext, memo: Map<string, Set<string>>): Set<string> {
   const key = `dir:${dir}`;
   const hit = memo.get(key);
@@ -8000,7 +8024,7 @@ function csharpProjectStaticUsings(dir: string, context: ResolutionContext, memo
       if (!f.endsWith('.cs')) continue;
       const text = context.readFile(f) ?? '';
       if (!text.includes('global using static')) continue;
-      for (const m of text.matchAll(/^\s*global\s+using\s+static\s+([\w.]+)\s*;/gm)) owners.add(m[1]!.split('.').pop()!);
+      for (const m of text.matchAll(/^\s*global\s+using\s+static\s+(?:global::)?([\w.]+)\s*;/gm)) owners.add(m[1]!);
     }
   } else {
     owners = new Set(csharpProjectStaticUsings(path.posix.dirname(dir), context, memo));
@@ -8019,7 +8043,7 @@ function csharpProjectStaticUsings(dir: string, context: ResolutionContext, memo
     } catch {
       continue;
     }
-    for (const m of text.matchAll(/<Using\s+Include\s*=\s*"([\w.]+)"[^>]*\bStatic\s*=\s*"true"/gi)) owners.add(m[1]!.split('.').pop()!);
+    for (const m of text.matchAll(/<Using\s+Include\s*=\s*"([\w.]+)"[^>]*\bStatic\s*=\s*"true"/gi)) owners.add(m[1]!);
   }
   memo.set(key, owners);
   return owners;
@@ -8054,6 +8078,22 @@ function csharpNamespaceScope(file: string, context: ResolutionContext): { names
   const scope = { namespaces, usings, aliases };
   memo.set(file, scope);
   return scope;
+}
+
+/** The F# declaration a C# name means, by C#'s lookup (see `matchDotnetNameInFsharp`). */
+function matchDotnetNameIntoFsharp(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
+  return matchDotnetNameInFsharp(ref, context, dotnetScopeForFsharp);
+}
+
+/**
+ * What a C# file can name, for F#'s check of a name it writes
+ * (`isFsharpReachableFromDotnet`): the same namespaces, usings and aliases the
+ * C# lookups here use, and the full paths of its `using static`.
+ */
+function dotnetScopeForFsharp(ref: UnresolvedRef, context: ResolutionContext): DotnetFileScope | null {
+  if (ref.language !== 'csharp') return null;
+  const scope = csharpNamespaceScope(ref.filePath, context);
+  return { namespaces: scope.namespaces, usings: scope.usings, aliases: scope.aliases, statics: csharpStaticUsingPaths(ref.filePath, context) };
 }
 
 /**
@@ -14509,6 +14549,9 @@ export function matchByExactName(
     // tsdb's `[]*memSeries` is head.go's, not `tsdb/agent`'s, which scored the
     // same (a child package's directory shares as much of the path) and won.
     (n.language !== 'go' || isGoNameVisible(n, ref, context)) &&
+    // An F# name is its file's, its scope's, an opened or a qualified one: ahead of
+    // the ranking, so the namesake in reach wins over one in an unreached namespace.
+    isFsharpCandidateInScope(n, ref, context, dotnetScopeForFsharp) &&
     dartExtensionDecl(n, context)?.named !== false &&
     // A Scala package object's member, only where it is in scope — ahead of
     // the ranking, so cats.laws' `Eq` can be the `cats` package object's.
@@ -22457,6 +22500,7 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   CSHARP_ALIASES.delete(context);
   SWIFT_HIERARCHIES.delete(context);
   KOTLIN_FILE_SCOPES.delete(context);
+  clearFsharpScopeCaches(context);
   RUBY_ANCESTRY.delete(context);
   PHP_TYPE_METHODS.delete(context);
   PHP_ANCESTRIES.delete(context);
@@ -22471,6 +22515,7 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   OBJC_SUPERS.delete(context);
   CSHARP_SUPERS.delete(context);
   CSHARP_STATIC_USINGS.delete(context);
+  CSHARP_STATIC_USING_PATHS.delete(context);
   CSHARP_NAMESPACE_SCOPES.delete(context);
   CSHARP_PROJECT_USINGS.delete(context);
   CSHARP_GLOBAL_USINGS.delete(context);
@@ -32707,7 +32752,16 @@ function matchReferenceInner(
     return nmTimed('storeAccessorChain', ref, () => matchStoreAccessorChain(ref, context));
   }
 
-  // 2. Method call pattern
+  // 2. A C# name of an F# declaration: an F# module is a static class to C#,
+  // its functions no class's methods, and an F# base class's members are the
+  // C# type's own, which the strategies below never find. C#'s lookup order,
+  // across both languages, decides it — a C# namesake nearer the code wins.
+  if (ref.language === 'csharp') {
+    result = nmTimed('dotnetToFsharp', ref, () => matchDotnetNameIntoFsharp(ref, context));
+    if (result) return result;
+  }
+
+  // 2b. Method call pattern
   result = nmTimed('methodCall', ref, () => matchMethodCall(ref, context));
   if (result) return result;
 
