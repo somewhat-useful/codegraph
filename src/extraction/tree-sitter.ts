@@ -16,6 +16,7 @@ import {
   UnresolvedReference,
 } from '../types';
 import { getParser, detectLanguage, isLanguageSupported, isFileLevelOnlyLanguage } from './grammars';
+import { parserInput } from './parse-budget';
 import { NodeIdAllocator, getNodeText, getChildByField, getPrecedingDocstring, BUILTIN_TYPE_NAMES, namedArgCount } from './tree-sitter-helpers';
 import { FN_REF_SPECS, captureFnRefCandidates, goScopedFnRefScopes, type FnRefSpec, type FnRefCandidate } from './function-ref';
 import { isGeneratedFile, isMinifiedContent } from './generated-detection';
@@ -845,6 +846,7 @@ export class TreeSitterExtractor {
   private nodeIds = new NodeIdAllocator();
   private edges: Edge[] = [];
   private unresolvedReferences: UnresolvedReference[] = [];
+  private fsharpFacts: ExtractionResult['fsharpFacts'];
   // Value-reference edges (default ON; set CODEGRAPH_VALUE_REFS=0 to disable; see flushValueRefs).
   // Same-file reads of file-scope const/var symbols → `references` edges so impact analysis catches
   // value consumers ("change this constant/table, affect its readers").
@@ -1026,7 +1028,7 @@ export class TreeSitterExtractor {
         if (preParsed !== this.source) this.sourceAsWritten = this.source;
         this.source = preParsed;
       }
-      this.tree = parser.parse(this.source) ?? null;
+      this.tree = parser.parse(parserInput(this.source, this.language)) ?? null;
       if (!this.tree) {
         throw new Error('Parser returned null tree');
       }
@@ -1129,6 +1131,7 @@ export class TreeSitterExtractor {
       unresolvedReferences: this.unresolvedReferences,
       errors: this.errors,
       durationMs: Date.now() - startTime,
+      ...(this.fsharpFacts ? { fsharpFacts: this.fsharpFacts } : {}),
     };
   }
 
@@ -2280,6 +2283,7 @@ export class TreeSitterExtractor {
         self.visitFunctionBody(node, functionId);
       },
       addUnresolvedReference: (ref) => self.unresolvedReferences.push(ref),
+      setFsharpFacts: (facts) => { self.fsharpFacts = facts; },
       pushScope: (nodeId) => self.nodeStack.push(nodeId),
       popScope: () => self.nodeStack.pop(),
       get filePath() { return self.filePath; },
@@ -7646,16 +7650,17 @@ export class TreeSitterExtractor {
       } else if (this.language === 'kotlin' && nodeType === 'infix_expression') {
         this.extractKotlinInfixCall(node);
       } else if (this.extractor!.extractBareCall) {
-        const calleeName = this.extractor!.extractBareCall(node, this.source);
-        if (calleeName && this.nodeStack.length > 0) {
+        const bare = this.extractor!.extractBareCall(node, this.source);
+        const call = typeof bare === 'string' ? { name: bare, at: node } : bare;
+        if (call && call.name && this.nodeStack.length > 0) {
           const callerId = this.nodeStack[this.nodeStack.length - 1];
           if (callerId) {
             this.unresolvedReferences.push({
               fromNodeId: callerId,
-              referenceName: calleeName,
+              referenceName: call.name,
               referenceKind: 'calls',
-              line: node.startPosition.row + 1,
-              column: node.startPosition.column,
+              line: call.at.startPosition.row + 1,
+              column: call.at.startPosition.column,
             });
           }
         }

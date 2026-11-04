@@ -7,6 +7,7 @@
  */
 
 import { Node as SyntaxNode } from 'web-tree-sitter';
+import type { FileFacts } from './languages/fsharp-store';
 import {
   Node,
   NodeKind,
@@ -31,6 +32,8 @@ export interface ImportInfo {
  * references without accessing the full TreeSitterExtractor internals.
  */
 export interface ExtractorContext {
+  /** Hand the extraction result what the F# extractor read for its own database (`ExtractionResult.fsharpFacts`). */
+  setFsharpFacts(facts: FileFacts): void;
   /** Create a node and add it to the extraction result */
   createNode(kind: NodeKind, name: string, node: SyntaxNode, extra?: Partial<Node>): Node | null;
   /** Visit a child node (dispatches through the standard visitNode logic) */
@@ -68,6 +71,12 @@ export interface ExtractorContext {
  * that configures which AST node types to look for and how to extract
  * language-specific details like signatures, visibility, and imports.
  */
+/** A call `extractBareCall` found: the callee's reference name, and the node it is written at. */
+export interface BareCall {
+  name: string;
+  at: SyntaxNode;
+}
+
 export interface LanguageExtractor {
   /**
    * Optional source transform applied immediately before the grammar parses the
@@ -374,9 +383,11 @@ export interface LanguageExtractor {
    * Detect bare method calls that don't use call expression syntax.
    * Used by Ruby where `reset` (no parens, no receiver) is a method call but
    * tree-sitter parses it as a plain `identifier` node instead of `call`/`method_call`.
-   * Returns the callee name if this node is a bare call, or undefined if not.
+   * Returns the callee name if this node is a bare call, or undefined if not —
+   * or, where the callee is not where the call starts (F#'s `f 1 + g 2` is
+   * one application), the callee's name with the node it is written at.
    */
-  extractBareCall?: (node: SyntaxNode, source: string) => string | undefined;
+  extractBareCall?: (node: SyntaxNode, source: string) => string | BareCall | undefined;
 
   /**
    * Detect a member read that may run code — Dart's `x.area`, which calls the
