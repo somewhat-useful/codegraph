@@ -7,7 +7,6 @@
  */
 
 import { Node as SyntaxNode } from 'web-tree-sitter';
-import type { FileFacts } from './languages/fsharp-store';
 import {
   Node,
   NodeKind,
@@ -32,8 +31,6 @@ export interface ImportInfo {
  * references without accessing the full TreeSitterExtractor internals.
  */
 export interface ExtractorContext {
-  /** Hand the extraction result what the F# extractor read for its own database (`ExtractionResult.fsharpFacts`). */
-  setFsharpFacts(facts: FileFacts): void;
   /** Create a node and add it to the extraction result */
   createNode(kind: NodeKind, name: string, node: SyntaxNode, extra?: Partial<Node>): Node | null;
   /** Visit a child node (dispatches through the standard visitNode logic) */
@@ -56,6 +53,8 @@ export interface ExtractorContext {
   popScope(): void;
   /** Current file path */
   readonly filePath: string;
+  /** The root of the project the file is being indexed into; absent when a source is only read, not indexed. */
+  readonly projectRoot: string | undefined;
   /** Current source text */
   readonly source: string;
   /** Stack of parent node IDs (current scope) */

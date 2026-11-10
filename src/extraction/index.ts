@@ -37,7 +37,6 @@ import { createYielder, type MaybeYield } from '../resolution/cooperative-yield'
 import { resurrectRefFromDroppedEdge } from '../resolution/resurrect-ref';
 import { createImportReader, reopenReferencesThroughRemovedFiles } from '../resolution/module-importers';
 import { MAX_SOURCE_FILE_SIZE_BYTES, oversizeStamp, readBoundedSource, readBoundedSourceSync } from '../file-limits';
-import { startFsharpStoreOwner, type FsharpStoreOwner } from './languages/fsharp-store-owner';
 export { oversizeStamp };
 
 /**
@@ -2465,16 +2464,7 @@ export class ExtractionOrchestrator {
   /**
    * Index all files in the project
    */
-  /** Index every file; then what F# keeps of its own (`fsharp.db`) is written before anything resolves. */
-  async indexAll(...args: Parameters<ExtractionOrchestrator['indexAllFiles']>): Promise<IndexResult> {
-    try {
-      return await this.indexAllFiles(...args);
-    } finally {
-      await this.closeFsharpStore();
-    }
-  }
-
-  private async indexAllFiles(
+  async indexAll(
     onProgress?: (progress: IndexProgress) => void,
     signal?: AbortSignal,
     verbose?: boolean,
@@ -2665,8 +2655,8 @@ export class ExtractionOrchestrator {
     const parseFile = (filePath: string, content: string): Promise<ExtractionResult> => {
       const language = detectLanguage(filePath, content, overrides, this.rootDir);
       const names = this.frameworksForFile(filePath, frameworkNames);
-      if (!pool) return Promise.resolve(extractFromSource(filePath, content, language, names));
-      return pool.requestParse({ filePath, content, language, frameworkNames: names });
+      if (!pool) return Promise.resolve(extractFromSource(filePath, content, language, names, this.rootDir));
+      return pool.requestParse({ filePath, content, language, frameworkNames: names, projectRoot: this.rootDir });
     };
 
     // --- Bounded rolling-window dispatch, ordered commit ---
@@ -2719,7 +2709,6 @@ export class ExtractionOrchestrator {
         // Store nothing: a row from an earlier run keeps its data, and with no
         // row (or an older hash) the next sync or index retries the file.
       } else if (storeWriter) {
-        this.keepFsharpFacts(filePath, result);
         if (result.kernelBuffers) {
           // Buffers go to the writer as-is; the worker decodes + finalizes.
           // The main thread's only per-file work stays O(1) + the content hash.
@@ -3167,16 +3156,7 @@ export class ExtractionOrchestrator {
   /**
    * Index specific files
    */
-  /** Index `filePaths`; then what F# keeps of its own (`fsharp.db`) is written before anything resolves. */
   async indexFiles(filePaths: string[]): Promise<IndexResult> {
-    try {
-      return await this.indexListedFiles(filePaths);
-    } finally {
-      await this.closeFsharpStore();
-    }
-  }
-
-  private async indexListedFiles(filePaths: string[]): Promise<IndexResult> {
     const startTime = Date.now();
     const errors: ExtractionError[] = [];
     let filesIndexed = 0;
@@ -3334,7 +3314,7 @@ export class ExtractionOrchestrator {
     // otherwise detect on the spot so single-file re-index paths still emit
     // route nodes / middleware / etc.
     const frameworkNames = this.frameworksForFile(relativePath, this.ensureDetectedFrameworks());
-    const result = extractFromSource(relativePath, content, language, frameworkNames);
+    const result = extractFromSource(relativePath, content, language, frameworkNames, this.rootDir);
 
     // Store in database
     await this.storeExtractionResult(relativePath, content, language, stats, result, createYielder());
@@ -3373,22 +3353,6 @@ export class ExtractionOrchestrator {
     }
   }
 
-  /** The owner of `fsharp.db` while an index or a sync sends it what F# read; started by the first file that has some. */
-  private fsharpStore: FsharpStoreOwner | null = null;
-
-  /** Send what the F# extractor read for `filePath` to the owner of `fsharp.db`. */
-  private keepFsharpFacts(filePath: string, result: ExtractionResult): void {
-    if (!result.fsharpFacts) return;
-    (this.fsharpStore ??= startFsharpStoreOwner(this.rootDir)).send(filePath, result.fsharpFacts);
-  }
-
-  /** Wait until the owner of `fsharp.db` has written all it was sent, and close it. */
-  private async closeFsharpStore(): Promise<void> {
-    const store = this.fsharpStore;
-    this.fsharpStore = null;
-    if (store) await store.close();
-  }
-
   private async storeExtractionResult(
     filePath: string,
     content: string,
@@ -3402,7 +3366,6 @@ export class ExtractionOrchestrator {
     // content hash, which no hash-based sync revisits. Keep whatever the index
     // has; the stale (or missing) row makes the next sync retry the file.
     if (hasGrammarLoadFailure(result.errors)) return;
-    this.keepFsharpFacts(filePath, result);
 
     // A kernel result can arrive as an undecoded buffer transport (empty
     // node/edge arrays, tables riding in kernelBuffers). Decode it before
@@ -3857,16 +3820,7 @@ export class ExtractionOrchestrator {
    * changes. This works in non-git projects and catches committed changes from
    * `git pull`/`checkout`/`merge`/`rebase` that `git status` cannot see.
    */
-  /** Bring the index up to date with the files; then what F# keeps of its own (`fsharp.db`) is written before anything resolves. */
-  async sync(...args: Parameters<ExtractionOrchestrator['syncFiles']>): ReturnType<ExtractionOrchestrator['syncFiles']> {
-    try {
-      return await this.syncFiles(...args);
-    } finally {
-      await this.closeFsharpStore();
-    }
-  }
-
-  private async syncFiles(
+  async sync(
     onProgress?: (progress: IndexProgress) => void,
     /**
      * Watcher fast path: the exact project-relative paths the OS reported as

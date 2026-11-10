@@ -4,6 +4,7 @@ import type { ExtractorContext, LanguageExtractor } from '../tree-sitter-types';
 import { bindingOf, expressionType, isLocalName, literalType, parentOf, pathOf, receiverPath, typePath } from './fsharp-bindings';
 import {
   type ArgumentType,
+  keepFileFacts,
   type FileFacts,
   type FsharpArgument,
   type FsharpParameter,
@@ -1394,7 +1395,7 @@ export const fsharpExtractor: LanguageExtractor = {
       } finally {
         FILE_FACTS.delete(node.tree);
       }
-      ctx.setFsharpFacts(facts);
+      if (ctx.projectRoot !== undefined) keepFileFacts(ctx.projectRoot, ctx.filePath, facts);
       return true;
     }
 

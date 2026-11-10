@@ -839,6 +839,7 @@ export class TreeSitterExtractor {
   }
 
   private filePath: string;
+  private projectRoot: string | undefined;
   private language: Language;
   private source: string;
   private tree: Tree | null = null;
@@ -846,7 +847,6 @@ export class TreeSitterExtractor {
   private nodeIds = new NodeIdAllocator();
   private edges: Edge[] = [];
   private unresolvedReferences: UnresolvedReference[] = [];
-  private fsharpFacts: ExtractionResult['fsharpFacts'];
   // Value-reference edges (default ON; set CODEGRAPH_VALUE_REFS=0 to disable; see flushValueRefs).
   // Same-file reads of file-scope const/var symbols → `references` edges so impact analysis catches
   // value consumers ("change this constant/table, affect its readers").
@@ -946,9 +946,10 @@ export class TreeSitterExtractor {
     filePath: string,
     source: string,
     language?: Language,
-    options?: { sourceIsPreParsed?: boolean; sourceAsWritten?: string }
+    options?: { sourceIsPreParsed?: boolean; sourceAsWritten?: string; projectRoot?: string }
   ) {
     this.filePath = filePath;
+    this.projectRoot = options?.projectRoot;
     this.source = source;
     this.language = language || detectLanguage(filePath, source);
     this.extractor = EXTRACTORS[this.language] || null;
@@ -1131,7 +1132,6 @@ export class TreeSitterExtractor {
       unresolvedReferences: this.unresolvedReferences,
       errors: this.errors,
       durationMs: Date.now() - startTime,
-      ...(this.fsharpFacts ? { fsharpFacts: this.fsharpFacts } : {}),
     };
   }
 
@@ -2283,10 +2283,10 @@ export class TreeSitterExtractor {
         self.visitFunctionBody(node, functionId);
       },
       addUnresolvedReference: (ref) => self.unresolvedReferences.push(ref),
-      setFsharpFacts: (facts) => { self.fsharpFacts = facts; },
       pushScope: (nodeId) => self.nodeStack.push(nodeId),
       popScope: () => self.nodeStack.pop(),
       get filePath() { return self.filePath; },
+      get projectRoot() { return self.projectRoot; },
       get source() { return self.source; },
       get nodeStack() { return self.nodeStack; },
       get nodes() { return self.nodes; },
@@ -9983,7 +9983,8 @@ export function extractFromSource(
   filePath: string,
   source: string,
   language?: Language,
-  frameworkNames?: string[]
+  frameworkNames?: string[],
+  projectRoot?: string
 ): ExtractionResult {
   const detectedLanguage = language || detectLanguage(filePath, source);
   const fileExtension = path.extname(filePath).toLowerCase();
@@ -10053,7 +10054,7 @@ export function extractFromSource(
         filePath,
         deferredPre ?? source,
         detectedLanguage,
-        deferredPre != null ? { sourceIsPreParsed: true, sourceAsWritten: source } : undefined
+        deferredPre != null ? { sourceIsPreParsed: true, sourceAsWritten: source, projectRoot } : { projectRoot }
       );
       result = extractor.extract();
     }

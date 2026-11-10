@@ -3,7 +3,7 @@
  * database has no place for — the parameters a declaration has, and what the
  * tree shows where a reference is written — kept in a database of F#'s own,
  * `fsharp.db`, beside `codegraph.db`. The extractor replaces a file's rows each
- * time it reads the file; the resolver reads them.
+ * time it reads the file for the index; the resolver reads them.
  *
  * It follows `codegraph.db`: built for one database file, it empties itself
  * when that file is a new one — a full re-index — so it never holds what a
@@ -11,7 +11,7 @@
  */
 import * as fs from 'fs';
 import * as path from 'path';
-import { createDatabase, type SqliteDatabase, type SqliteStatement } from '../../db/sqlite-adapter';
+import { createDatabase, type SqliteDatabase } from '../../db/sqlite-adapter';
 import { getCodeGraphDir } from '../../directory';
 
 /** Where the grammar places a name. */
@@ -129,68 +129,61 @@ function codegraphGeneration(root: string): string | null {
 }
 
 /**
- * `fsharp.db` of `root` opened for writing, its tables in place and in step
- * with `codegraph.db`: emptied when that is a new database. Only the store's
- * owner (`FsharpStoreOwner`) opens it so, and keeps it until it is closed.
+ * Keep `facts` as what `file` of the project at `root` holds now, replacing
+ * what the store held for it. The store is opened for this one write and
+ * closed after it: whichever thread read the file writes its facts before it
+ * hands the file's result on, so a resolver never reads a file ahead of them,
+ * and no connection outlives the write to hold the directory. Being in step
+ * with `codegraph.db` is settled in the same transaction as the write, which
+ * takes the write lock first: of the threads that find a new `codegraph.db`
+ * together, one empties the store, and the others see that it has.
  */
-export function openStoreForWriting(root: string): SqliteDatabase {
+export function keepFileFacts(root: string, file: string, facts: FileFacts): void {
   const dir = getCodeGraphDir(root);
   fs.mkdirSync(dir, { recursive: true });
   const { db } = createDatabase(path.join(dir, 'fsharp.db'));
-  db.pragma('busy_timeout = 10000');
-  db.pragma('journal_mode = WAL');
-  db.pragma('synchronous = NORMAL');
-  db.exec(SCHEMA);
-  const generation = codegraphGeneration(root);
-  const stored = db.prepare("SELECT value FROM meta WHERE key = 'generation'").get() as { value: string } | undefined;
-  if (generation !== null && stored?.value !== generation) {
-    db.exec('DELETE FROM parameters; DELETE FROM sites; DELETE FROM site_labels; DELETE FROM site_args;');
-    db.prepare("INSERT OR REPLACE INTO meta (key, value) VALUES ('generation', ?)").run(generation);
+  try {
+    db.pragma('busy_timeout = 10000');
+    db.pragma('journal_mode = WAL');
+    db.pragma('synchronous = NORMAL');
+    db.exec(SCHEMA);
+    db.transaction(() => {
+      const generation = codegraphGeneration(root);
+      const stored = db.prepare("SELECT value FROM meta WHERE key = 'generation'").get() as { value: string } | undefined;
+      if (generation !== null && stored?.value !== generation) {
+        db.exec('DELETE FROM parameters; DELETE FROM sites; DELETE FROM site_labels; DELETE FROM site_args;');
+        db.prepare("INSERT OR REPLACE INTO meta (key, value) VALUES ('generation', ?)").run(generation);
+      }
+      replaceFileFacts(db, file, facts);
+    }, { immediate: true })();
+  } finally {
+    db.close();
   }
-  return db;
-}
-
-const STATEMENTS = new WeakMap<SqliteDatabase, Map<string, SqliteStatement>>();
-
-/** `sql` prepared on `db`, once per connection. */
-function statement(db: SqliteDatabase, sql: string): SqliteStatement {
-  let byText = STATEMENTS.get(db);
-  if (!byText) STATEMENTS.set(db, (byText = new Map()));
-  let prepared = byText.get(sql);
-  if (!prepared) byText.set(sql, (prepared = db.prepare(sql)));
-  return prepared;
-}
-
-/** Replace what the store holds for each of `files` with its facts, all in one transaction. */
-export function writeFileFacts(db: SqliteDatabase, files: ReadonlyArray<{ file: string; facts: FileFacts }>): void {
-  db.transaction(() => {
-    for (const { file, facts } of files) replaceFileFacts(db, file, facts);
-  })();
 }
 
 function replaceFileFacts(db: SqliteDatabase, file: string, facts: FileFacts): void {
   {
-    const old = statement(db, 'SELECT id FROM sites WHERE file = ?').all(file) as Array<{ id: number }>;
-    const dropLabels = statement(db, 'DELETE FROM site_labels WHERE site = ?');
-    const dropArgs = statement(db, 'DELETE FROM site_args WHERE site = ?');
+    const old = db.prepare('SELECT id FROM sites WHERE file = ?').all(file) as Array<{ id: number }>;
+    const dropLabels = db.prepare('DELETE FROM site_labels WHERE site = ?');
+    const dropArgs = db.prepare('DELETE FROM site_args WHERE site = ?');
     for (const { id } of old) {
       dropLabels.run(id);
       dropArgs.run(id);
     }
-    statement(db, 'DELETE FROM sites WHERE file = ?').run(file);
-    statement(db, 'DELETE FROM parameters WHERE file = ?').run(file);
+    db.prepare('DELETE FROM sites WHERE file = ?').run(file);
+    db.prepare('DELETE FROM parameters WHERE file = ?').run(file);
 
-    const addParameter = statement(db,
+    const addParameter = db.prepare(
       'INSERT OR REPLACE INTO parameters (file, node_id, idx, name, type_kind, type_name, optional, param_array) VALUES (?, ?, ?, ?, ?, ?, ?, ?)');
     for (const { nodeId, parameters } of facts.parameters) {
       parameters.forEach((p, idx) => addParameter.run(file, nodeId, idx, p.name ?? null, p.type?.kind ?? null,
         p.type?.kind === 'name' ? p.type.name : null, p.optional ? 1 : 0, p.paramArray ? 1 : 0));
     }
 
-    const addSite = statement(db, `INSERT OR IGNORE INTO sites (file, line, col, kind, name, path, position, on_value, receiver_type, has_args,
+    const addSite = db.prepare(`INSERT OR IGNORE INTO sites (file, line, col, kind, name, path, position, on_value, receiver_type, has_args,
       is_copy, copy_type, label_line, label_col, label_name) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
-    const addLabel = statement(db, 'INSERT INTO site_labels (site, idx, path) VALUES (?, ?, ?)');
-    const addArg = statement(db,
+    const addLabel = db.prepare('INSERT INTO site_labels (site, idx, path) VALUES (?, ?, ?)');
+    const addArg = db.prepare(
       'INSERT INTO site_args (site, idx, named, type_kind, written_kind, type_text, field_index) VALUES (?, ?, ?, ?, ?, ?, ?)');
     for (const { key, site } of facts.sites) {
       const inserted = addSite.run(file, key.line, key.column, key.kind, key.name, joinPath(site.path), site.position, site.onValue ? 1 : 0, site.receiverType ?? null,
@@ -212,7 +205,7 @@ function replaceFileFacts(db: SqliteDatabase, file: string, facts: FileFacts): v
 /**
  * Run `read` on the store of `root`, opened only for reading, when it is in
  * step with `codegraph.db`; otherwise nothing it holds is trusted, and `read`
- * is not run. Readers never wait for the owner's writes: the store is in WAL mode.
+ * is not run. Readers never wait for a write: the store is in WAL mode.
  */
 function readStore(root: string, read: (db: SqliteDatabase) => void): void {
   const file = path.join(getCodeGraphDir(root), 'fsharp.db');
@@ -258,11 +251,11 @@ export function readFileFacts(root: string, file: string): { sites: Map<string, 
 function readSites(db: SqliteDatabase, file: string, out: Map<string, FsharpSite>): void {
   type SiteRow = { id: number; line: number; col: number; kind: string; name: string; path: string; position: FsharpPosition; on_value: number; receiver_type: string | null;
     has_args: number; is_copy: number; copy_type: string | null; label_line: number | null; label_col: number | null; label_name: string | null };
-  const rows = statement(db, 'SELECT * FROM sites WHERE file = ?').all(file) as SiteRow[];
+  const rows = db.prepare('SELECT * FROM sites WHERE file = ?').all(file) as SiteRow[];
   if (rows.length === 0) return;
-  const labels = statement(db, `SELECT l.site, l.idx, l.path FROM site_labels l JOIN sites s ON s.id = l.site
+  const labels = db.prepare(`SELECT l.site, l.idx, l.path FROM site_labels l JOIN sites s ON s.id = l.site
     WHERE s.file = ? ORDER BY l.site, l.idx`).all(file) as Array<{ site: number; idx: number; path: string }>;
-  const args = statement(db, `SELECT a.* FROM site_args a JOIN sites s ON s.id = a.site WHERE s.file = ? ORDER BY a.site, a.idx`).all(file) as Array<{
+  const args = db.prepare(`SELECT a.* FROM site_args a JOIN sites s ON s.id = a.site WHERE s.file = ? ORDER BY a.site, a.idx`).all(file) as Array<{
     site: number; idx: number; named: string | null; type_kind: string | null; written_kind: string | null; type_text: string | null; field_index: number | null }>;
   const byId = new Map<number, FsharpSite>();
   for (const r of rows) {
@@ -297,7 +290,7 @@ function readSites(db: SqliteDatabase, file: string, out: Map<string, FsharpSite
 
 /** The parameters of the declarations of `file` the store holds, by node id. */
 function readParameters(db: SqliteDatabase, file: string, out: Map<string, FsharpParameter[]>): void {
-  const rows = statement(db, 'SELECT * FROM parameters WHERE file = ? ORDER BY node_id, idx').all(file) as Array<{
+  const rows = db.prepare('SELECT * FROM parameters WHERE file = ? ORDER BY node_id, idx').all(file) as Array<{
     node_id: string; name: string | null; type_kind: string | null; type_name: string | null; optional: number; param_array: number }>;
   for (const r of rows) {
     const type = writtenType(r.type_kind, r.type_name);

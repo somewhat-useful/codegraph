@@ -345,12 +345,6 @@ export interface ExtractionResult {
     arena: Uint8Array;
   };
   kernelCounts?: { nodes: number; edges: number; refs: number };
-
-  /**
-   * What the F# extractor read from the syntax tree that the graph has no
-   * place for, which the store sends on to F#'s own database (`fsharp.db`).
-   */
-  fsharpFacts?: import('./extraction/languages/fsharp-store').FileFacts;
 }
 
 /**
